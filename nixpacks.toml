@@ -1,5 +1,5 @@
 [phases.setup]
-nixPkgs = ["python313", "sqlite"]
+nixPkgs = ["python313", "sqlite3", "gcc", "stdenv.cc.cc.lib"]
 
 [phases.install]
 cmds = ["pip install -r requirements.txt"]
