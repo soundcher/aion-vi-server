@@ -1,28 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Код Жизни — локальный сервер расчётов
+Код Жизни — сервер расчётов
 Запуск: python server.py
 Порт: http://localhost:5050
 """
 
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import swisseph as swe
+import ephem
 import math
 from datetime import datetime, timedelta
 import requests as http_requests
 import anthropic
+import os
 
-# 250025002500 04120421042204100412042c 04210412041e0419 041a041b042e0427 0421042e04140410 25002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500
-ANTHROPIC_API_KEY = ""
-# 250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500250025002500
+ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 
 app = Flask(__name__)
 CORS(app)
-
-# Swiss Ephemeris — режим Moshier (без внешних файлов)
-swe.set_ephe_path('')
 
 # ─────────────────────────────────────────────
 # КОНСТАНТЫ
@@ -33,21 +29,6 @@ ZODIAC_SIGNS_RU = [
     "Лев", "Дева", "Весы", "Скорпион",
     "Стрелец", "Козерог", "Водолей", "Рыбы"
 ]
-
-PLANETS = {
-    "Солнце":    swe.SUN,
-    "Луна":      swe.MOON,
-    "Меркурий":  swe.MERCURY,
-    "Венера":    swe.VENUS,
-    "Марс":      swe.MARS,
-    "Юпитер":    swe.JUPITER,
-    "Сатурн":    swe.SATURN,
-    "Уран":      swe.URANUS,
-    "Нептун":    swe.NEPTUNE,
-    "Плутон":    swe.PLUTO,
-}
-
-HOUSE_SYSTEMS = b'P'  # Placidus
 
 STEMS_RU = ["Цзя","И","Бин","Дин","У","Цзи","Гэн","Синь","Жэнь","Гуй"]
 BRANCHES_RU = ["Цзы","Чоу","Инь","Мао","Чэнь","Сы","У","Вэй","Шэнь","Ю","Сюй","Хай"]
@@ -88,16 +69,6 @@ CHINESE_NY = {
     2040:"12.02",2041:"01.02",2042:"22.01",2043:"10.02",
 }
 
-# Human Design — типы по профилям Солнца
-HD_TYPES = {
-    "Манифестор": list(range(0, 30)),        # упрощённая логика ниже
-    "Генератор": list(range(30, 180)),
-    "Проектор": list(range(180, 270)),
-    "Рефлектор": list(range(270, 360)),
-}
-
-# HD ворота — 64 гексаграммы И-Цзин, соответствие градусам зодиака
-# Каждые 5.625° = 1 ворота (360/64)
 HD_GATES = [
     41,19,13,49,30,55,37,63,22,36,25,17,21,51,42,3,
     27,24,2,23,8,20,16,35,45,12,15,52,39,53,62,56,
@@ -130,7 +101,6 @@ CYRILLIC_PYTH = {
 # ─────────────────────────────────────────────
 
 def deg_to_sign(lon):
-    """Градус эклиптики → знак зодиака + позиция внутри знака"""
     sign_idx = int(lon / 30)
     deg_in_sign = lon - sign_idx * 30
     sign = ZODIAC_SIGNS_RU[sign_idx % 12]
@@ -157,7 +127,6 @@ def reduce_to_22(n):
     return n
 
 def geocode(place_name):
-    """Геокодирование через Nominatim (OpenStreetMap) — бесплатно, без ключа"""
     try:
         url = "https://nominatim.openstreetmap.org/search"
         params = {"q": place_name, "format": "json", "limit": 1}
@@ -171,8 +140,6 @@ def geocode(place_name):
     return None, None, None
 
 def local_to_ut(year, month, day, hour, minute, lon):
-    """Конвертация местного времени в UT через timezone offset по долготе"""
-    # Приблизительный UTC offset по долготе (±12 часов)
     offset = round(lon / 15)
     total_minutes = hour * 60 + minute - offset * 60
     base = datetime(year, month, day)
@@ -180,79 +147,130 @@ def local_to_ut(year, month, day, hour, minute, lon):
     return dt_ut.year, dt_ut.month, dt_ut.day, dt_ut.hour + dt_ut.minute/60.0
 
 # ─────────────────────────────────────────────
-# АСТРОЛОГИЯ — Swiss Ephemeris (Moshier)
+# АСТРОЛОГИЯ — ephem (замена pyswisseph)
 # ─────────────────────────────────────────────
 
+EPHEM_PLANETS = {
+    "Солнце":   ephem.Sun,
+    "Луна":     ephem.Moon,
+    "Меркурий": ephem.Mercury,
+    "Венера":   ephem.Venus,
+    "Марс":     ephem.Mars,
+    "Юпитер":   ephem.Jupiter,
+    "Сатурн":   ephem.Saturn,
+    "Уран":     ephem.Uranus,
+    "Нептун":   ephem.Neptune,
+}
+
+def get_planet_lon(planet_class, date_str):
+    """Возвращает эклиптическую долготу планеты в градусах"""
+    p = planet_class()
+    p.compute(date_str, epoch='2000')
+    # ephem даёт эклиптическую долготу в радианах через ecl_lon
+    ecl = ephem.Ecliptic(p, epoch='2000')
+    lon = math.degrees(ecl.lon) % 360
+    return lon
+
+def datetime_to_ephem_str(year, month, day, h_float):
+    """Конвертация в строку для ephem: 'YYYY/MM/DD HH:MM:SS'"""
+    hour = int(h_float)
+    minute = int((h_float - hour) * 60)
+    second = int(((h_float - hour) * 60 - minute) * 60)
+    return f"{year}/{month:02d}/{day:02d} {hour:02d}:{minute:02d}:{second:02d}"
+
+def calc_asc_mc(year, month, day, h_float, lat, lon):
+    """Асцендент и MC через формулу домов Плацидуса (приближение)"""
+    try:
+        # Юлианский день
+        a = (14 - month) // 12
+        y = year + 4800 - a
+        m = month + 12*a - 3
+        jd = day + (153*m+2)//5 + 365*y + y//4 - y//100 + y//400 - 32045 - 0.5 + h_float/24.0
+
+        # Звёздное время (Greenwich Sidereal Time)
+        T = (jd - 2451545.0) / 36525.0
+        gst = 280.46061837 + 360.98564736629 * (jd - 2451545.0) + T*T*(0.000387933 - T/38710000)
+        gst = gst % 360
+        lst = (gst + lon) % 360  # местное звёздное время в градусах
+
+        # MC (Midheaven)
+        mc_rad = math.atan2(math.tan(math.radians(lst)), math.cos(math.radians(23.4393)))
+        mc = math.degrees(mc_rad) % 360
+
+        # Асцендент
+        lat_r = math.radians(lat)
+        e_r = math.radians(23.4393)
+        lst_r = math.radians(lst)
+        asc_rad = math.atan2(math.cos(lst_r),
+                             -(math.sin(lst_r)*math.cos(e_r) + math.tan(lat_r)*math.sin(e_r)))
+        asc = (math.degrees(asc_rad) + 180) % 360
+
+        return asc, mc
+    except Exception:
+        return None, None
+
 def calc_natal(year, month, day, hour, minute, lat, lon):
-    """Полный натальный расчёт"""
+    """Натальный расчёт через ephem"""
     y, mo, d, h = local_to_ut(year, month, day, hour, minute, lon)
-    jd = swe.julday(y, mo, d, h)
-    flag = swe.FLG_MOSEPH
+    date_str = datetime_to_ephem_str(y, mo, d, h)
 
     planets = {}
-    for name, planet_id in PLANETS.items():
+    for name, planet_class in EPHEM_PLANETS.items():
         try:
-            pos, _ = swe.calc_ut(jd, planet_id, flag)
-            sign, deg, mn = deg_to_sign(pos[0])
+            lon_deg = get_planet_lon(planet_class, date_str)
+            sign, deg, mn = deg_to_sign(lon_deg)
+            # Ретроградность через угловую скорость (приближение)
+            p1 = planet_class()
+            p1.compute(date_str, epoch='2000')
+            ecl1 = ephem.Ecliptic(p1, epoch='2000')
+            lon1 = math.degrees(ecl1.lon) % 360
+
+            # вычисляем положение через 1 день для определения ретро
+            dt2 = ephem.Date(ephem.Date(date_str) + 1)
+            p2 = planet_class()
+            p2.compute(dt2, epoch='2000')
+            ecl2 = ephem.Ecliptic(p2, epoch='2000')
+            lon2 = math.degrees(ecl2.lon) % 360
+
+            diff = lon2 - lon1
+            if diff > 180: diff -= 360
+            if diff < -180: diff += 360
+            retrograde = diff < 0
+
             planets[name] = {
-                "lon": round(pos[0], 4),
+                "lon": round(lon_deg, 4),
                 "sign": sign,
                 "deg": deg,
                 "min": mn,
-                "formatted": format_pos(pos[0]),
-                "retrograde": pos[3] < 0
+                "formatted": format_pos(lon_deg),
+                "retrograde": retrograde
             }
         except Exception as e:
             planets[name] = {"error": str(e)}
 
-    # Дома (Placidus)
+    # Асцендент и MC
     houses_data = {}
-    asc_lon = None
-    mc_lon = None
-    try:
-        cusps, ascmc = swe.houses(jd, lat, lon, HOUSE_SYSTEMS)
-        asc_lon = ascmc[0]
-        mc_lon = ascmc[1]
-        for i, cusp in enumerate(cusps):
-            sign, deg, mn = deg_to_sign(cusp)
-            houses_data[f"Дом {i+1}"] = {
-                "lon": round(cusp, 4),
-                "sign": sign,
-                "deg": deg,
-                "min": mn,
-                "formatted": format_pos(cusp)
-            }
-        asc_sign, asc_deg, asc_min = deg_to_sign(asc_lon)
-        mc_sign, mc_deg, mc_min = deg_to_sign(mc_lon)
+    asc, mc = calc_asc_mc(y, mo, d, h, lat, lon)
+    if asc is not None:
         houses_data["Асцендент"] = {
-            "lon": round(asc_lon, 4),
-            "sign": asc_sign,
-            "deg": asc_deg,
-            "min": asc_min,
-            "formatted": format_pos(asc_lon)
+            "lon": round(asc, 4),
+            "formatted": format_pos(asc)
         }
+    if mc is not None:
         houses_data["MC (Середина Неба)"] = {
-            "lon": round(mc_lon, 4),
-            "sign": mc_sign,
-            "deg": mc_deg,
-            "min": mc_min,
-            "formatted": format_pos(mc_lon)
+            "lon": round(mc, 4),
+            "formatted": format_pos(mc)
         }
-    except Exception as e:
-        houses_data["error"] = str(e)
 
-    # Основные аспекты (Солнце, Луна, Асц)
     aspects = calc_aspects(planets)
 
     return {
-        "julian_day": round(jd, 6),
         "planets": planets,
         "houses": houses_data,
         "aspects": aspects
     }
 
 def calc_aspects(planets):
-    """Основные аспекты между планетами"""
     ASPECT_TYPES = {
         0: ("Соединение", 8),
         60: ("Секстиль", 6),
@@ -280,11 +298,79 @@ def calc_aspects(planets):
     return aspects
 
 # ─────────────────────────────────────────────
-# BAZI — ЧЕТЫРЕ СТОЛПА
+# HUMAN DESIGN
+# ─────────────────────────────────────────────
+
+def get_hd_gate(lon):
+    idx = int(lon / (360/64)) % 64
+    return HD_GATES[idx]
+
+def calc_human_design(year, month, day, hour, minute, lat, lon):
+    y, mo, d, h = local_to_ut(year, month, day, hour, minute, lon)
+    date_str = datetime_to_ephem_str(y, mo, d, h)
+
+    # Дата Дизайна (~88 дней до рождения)
+    design_date = ephem.Date(ephem.Date(date_str) - 88)
+
+    try:
+        # Личность
+        sun_p = get_planet_lon(ephem.Sun, date_str)
+        moon_p = get_planet_lon(ephem.Moon, date_str)
+        # Дизайн
+        sun_d = get_planet_lon(ephem.Sun, design_date)
+        moon_d = get_planet_lon(ephem.Moon, design_date)
+    except Exception as e:
+        return {"error": str(e)}
+
+    gate_sun_p = get_hd_gate(sun_p)
+    gate_moon_p = get_hd_gate(moon_p)
+    gate_sun_d = get_hd_gate(sun_d)
+    gate_moon_d = get_hd_gate(moon_d)
+
+    line = int((sun_p % (360/64)) / (360/64/6)) + 1
+    if line > 6: line = 6
+    line2 = int((sun_d % (360/64)) / (360/64/6)) + 1
+    if line2 > 6: line2 = 6
+
+    profile = f"{line}/{line2}"
+
+    if sun_p < 90 or sun_p >= 270:
+        hd_type = "Генератор"
+        strategy = "Ждать и реагировать"
+    elif 90 <= sun_p < 150:
+        hd_type = "Проектор"
+        strategy = "Ждать приглашения"
+    elif 150 <= sun_p < 210:
+        hd_type = "Манифестор"
+        strategy = "Информировать и действовать"
+    else:
+        hd_type = "Генератор-Манифестор"
+        strategy = "Ждать, затем действовать"
+
+    LINE_NAMES = {
+        1:"Исследователь", 2:"Отшельник", 3:"Мученик",
+        4:"Оппортунист", 5:"Еретик", 6:"Ролевая модель"
+    }
+
+    return {
+        "type": hd_type,
+        "strategy": strategy,
+        "profile": profile,
+        "profile_name": f"{LINE_NAMES.get(line,'')} / {LINE_NAMES.get(line2,'')}",
+        "gates": {
+            "sun_personality": gate_sun_p,
+            "moon_personality": gate_moon_p,
+            "sun_design": gate_sun_d,
+            "moon_design": gate_moon_d,
+        },
+        "note": "Базовый расчёт. Для полного HD используй myhumandesign.ru"
+    }
+
+# ─────────────────────────────────────────────
+# БАЦЗЫ
 # ─────────────────────────────────────────────
 
 def get_bazi_year_pillar(year, month, day):
-    """Столп года — с учётом китайского нового года"""
     bazi_year = year
     if year in CHINESE_NY:
         ny_str = CHINESE_NY[year]
@@ -300,63 +386,27 @@ def get_bazi_year_pillar(year, month, day):
             "pillar": f"{stem}-{branch}", "year": bazi_year}
 
 def get_bazi_month_pillar(year, month, day):
-    """Столп месяца — метод Ся (солнечные термины цзеци)"""
-    # Даты начала солнечных терминов (Личунь и далее) — приближённые
-    # Формат: (месяц_григ, день_начала_лунного_месяца)
-    # Инь=февраль, Мао=март ... Чоу=январь
     JIEQI = [
-        (1, 6),   # Сяохань/Дахань → Чоу (1й лунный завершается)
-        (2, 4),   # Личунь → Инь (3й лунный)
-        (3, 6),   # Цзинчжэ → Мао
-        (4, 5),   # Цинмин → Чэнь
-        (5, 6),   # Лися → Сы
-        (6, 6),   # Манчжун → У
-        (7, 7),   # Сяошу → Вэй
-        (8, 7),   # Лицю → Шэнь
-        (9, 8),   # Байлу → Ю
-        (10, 8),  # Хань-лу → Сюй
-        (11, 7),  # Лидун → Хай
-        (12, 7),  # Дасюэ → Цзы
+        (1, 6),(2, 4),(3, 6),(4, 5),(5, 6),(6, 6),
+        (7, 7),(8, 7),(9, 8),(10, 8),(11, 7),(12, 7),
     ]
-    # Лунный месяц (1=Инь): Инь соответствует ~февралю
-    # Ветви месяцев: Инь=2, Мао=3, Чэнь=4, Сы=5, У=6, Вэй=7,
-    #                Шэнь=8, Ю=9, Сюй=10, Хай=11, Цзы=0, Чоу=1
-    # Ветвь месяца по григорианскому месяцу
-    # Янв→Чоу(1), Фев→Инь(2), Мар→Мао(3), Апр→Чэнь(4),
-    # Май→Сы(5), Июн→У(6), Июл→Вэй(7), Авг→Шэнь(8),
-    # Сен→Ю(9), Окт→Сюй(10), Ноя→Хай(11), Дек→Цзы(0)
     MONTH_BRANCH = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 0]
-
     term_day = JIEQI[month - 1][1]
     m = month if day >= term_day else month - 1
     if m <= 0:
         m = 12
         year -= 1
-
     branch_idx = MONTH_BRANCH[m - 1]
-
-    # Стебель месяца зависит от стебля года
-    # Таблица: для каждого стебля года — стебель Инь-месяца (лунный месяц 1)
-    # Цзя(0)/Цзи(5) → Инь=Бин(2)
-    # И(1)/Гэн(6)   → Инь=У(4)
-    # Бин(2)/Синь(7) → Инь=Гэн(6)
-    # Дин(3)/Жэнь(8) → Инь=Жэнь(8)
-    # У(4)/Гуй(9)   → Инь=Цзя(0)
     YEAR_TO_YIN_STEM = {0:2, 1:4, 2:6, 3:8, 4:0, 5:2, 6:4, 7:6, 8:8, 9:0}
-
     year_stem_idx = (year - 4) % 10
     yin_stem = YEAR_TO_YIN_STEM[year_stem_idx]
-
-    # Лунный номер от Инь: Инь(2)=1, Мао(3)=2, Чэнь(4)=3...Хай(11)=10, Цзы(0)=11, Чоу(1)=12
     if branch_idx >= 2:
         lunar_num = branch_idx - 1
-    elif branch_idx == 0:   # Цзы
+    elif branch_idx == 0:
         lunar_num = 11
-    else:                   # Чоу
+    else:
         lunar_num = 12
-
     stem_idx = (yin_stem + lunar_num - 1) % 10
-
     return {
         "stem": STEMS_RU[stem_idx],
         "branch": BRANCHES_RU[branch_idx],
@@ -366,12 +416,11 @@ def get_bazi_month_pillar(year, month, day):
     }
 
 def get_bazi_day_pillar(year, month, day):
-    """Столп дня — через юлианский день (калиброванная формула)"""
     a = (14 - month) // 12
     y = year + 4800 - a
     m = month + 12*a - 3
     jdn = day + (153*m+2)//5 + 365*y + y//4 - y//100 + y//400 - 32045
-    OFFSET = 49  # откалиброван по эталону bazi-calculator.com (Рыбин 29.04.1981=Дин-Чоу)
+    OFFSET = 49
     n = (jdn + OFFSET) % 60
     stem_idx = n % 10
     branch_idx = n % 12
@@ -384,61 +433,7 @@ def get_bazi_day_pillar(year, month, day):
         "jdn": jdn, "n60": n
     }
 
-def get_bazi_hour_pillar(year, month, day, hour, minute, day_stem_idx):
-    """Столп часа — двухчасовые интервалы.
-    Правило: час Цзы (23:00–01:00) принадлежит СЛЕДУЮЩЕМУ дню.
-    Поэтому если время >= 23:00, используем стебель следующего дня.
-    """
-    total_min = hour * 60 + minute
-
-    # Двухчасовые интервалы
-    intervals = [
-        (23*60, 1*60, 0),   # Цзы  23:00–01:00
-        (1*60,  3*60, 1),   # Чоу  01:00–03:00
-        (3*60,  5*60, 2),   # Инь  03:00–05:00
-        (5*60,  7*60, 3),   # Мао  05:00–07:00
-        (7*60,  9*60, 4),   # Чэнь 07:00–09:00
-        (9*60,  11*60, 5),  # Сы   09:00–11:00
-        (11*60, 13*60, 6),  # У    11:00–13:00
-        (13*60, 15*60, 7),  # Вэй  13:00–15:00
-        (15*60, 17*60, 8),  # Шэнь 15:00–17:00
-        (17*60, 19*60, 9),  # Ю    17:00–19:00
-        (19*60, 21*60, 10), # Сюй  19:00–21:00
-        (21*60, 23*60, 11), # Хай  21:00–23:00
-    ]
-    branch_idx = 0
-    for start, end, idx in intervals:
-        if start > end:  # Цзы — переход через полночь
-            if total_min >= start or total_min < end:
-                branch_idx = idx
-                break
-        else:
-            if start <= total_min < end:
-                branch_idx = idx
-                break
-
-    # Если час Цзы (>=23:00) — стебель берём от СЛЕДУЮЩЕГО дня
-    effective_stem_idx = day_stem_idx
-    if total_min >= 23 * 60:
-        next_day = get_bazi_day_pillar_next(year, month, day)
-        effective_stem_idx = next_day
-
-    # Таблица Цзы-стеблей по стеблю дня:
-    # Цзя(0)/Цзи(5)→Цзя(0), И(1)/Гэн(6)→Бин(2), Бин(2)/Синь(7)→У(4)
-    # Дин(3)/Жэнь(8)→Гэн(6), У(4)/Гуй(9)→Жэнь(8)
-    ZI_STEM = [0, 2, 4, 6, 8, 0, 2, 4, 6, 8]
-    stem_idx = (ZI_STEM[effective_stem_idx % 10] + branch_idx) % 10
-
-    return {
-        "stem": STEMS_RU[stem_idx],
-        "branch": BRANCHES_RU[branch_idx],
-        "animal": ANIMALS_RU[branch_idx],
-        "element": ELEMENTS_RU[stem_idx],
-        "pillar": f"{STEMS_RU[stem_idx]}-{BRANCHES_RU[branch_idx]}"
-    }
-
 def get_bazi_day_pillar_next(year, month, day):
-    """Возвращает stem_idx следующего дня (для расчёта Цзы-часа)"""
     from datetime import date, timedelta
     try:
         d = date(year, month, day) + timedelta(days=1)
@@ -451,120 +446,65 @@ def get_bazi_day_pillar_next(year, month, day):
     jdn = nd + (153*m+2)//5 + 365*y + y//4 - y//100 + y//400 - 32045
     return (jdn + 49) % 10
 
+def get_bazi_hour_pillar(year, month, day, hour, minute, day_stem_idx):
+    total_min = hour * 60 + minute
+    intervals = [
+        (23*60, 1*60, 0),
+        (1*60,  3*60, 1),
+        (3*60,  5*60, 2),
+        (5*60,  7*60, 3),
+        (7*60,  9*60, 4),
+        (9*60,  11*60, 5),
+        (11*60, 13*60, 6),
+        (13*60, 15*60, 7),
+        (15*60, 17*60, 8),
+        (17*60, 19*60, 9),
+        (19*60, 21*60, 10),
+        (21*60, 23*60, 11),
+    ]
+    branch_idx = 0
+    for start, end, idx in intervals:
+        if start > end:
+            if total_min >= start or total_min < end:
+                branch_idx = idx
+                break
+        else:
+            if start <= total_min < end:
+                branch_idx = idx
+                break
+    effective_stem_idx = day_stem_idx
+    if total_min >= 23 * 60:
+        next_day = get_bazi_day_pillar_next(year, month, day)
+        effective_stem_idx = next_day
+    ZI_STEM = [0, 2, 4, 6, 8, 0, 2, 4, 6, 8]
+    stem_idx = (ZI_STEM[effective_stem_idx % 10] + branch_idx) % 10
+    return {
+        "stem": STEMS_RU[stem_idx],
+        "branch": BRANCHES_RU[branch_idx],
+        "animal": ANIMALS_RU[branch_idx],
+        "element": ELEMENTS_RU[stem_idx],
+        "pillar": f"{STEMS_RU[stem_idx]}-{BRANCHES_RU[branch_idx]}"
+    }
+
 def calc_bazi(year, month, day, hour, minute):
-    """Все четыре столпа БаЦзы"""
     year_p = get_bazi_year_pillar(year, month, day)
     month_p = get_bazi_month_pillar(year, month, day)
     day_p = get_bazi_day_pillar(year, month, day)
-
-    # Стебель дня нужен для часового столпа
     a = (14 - month) // 12
     y2 = year + 4800 - a
     m2 = month + 12*a - 3
     jdn = day + (153*m2+2)//5 + 365*y2 + y2//4 - y2//100 + y2//400 - 32045
     day_stem_idx = (jdn + 29) % 10
-
     hour_p = get_bazi_hour_pillar(year, month, day, hour, minute, day_stem_idx)
-
-    # Пять стихий — подсчёт баланса
     elements_count = {"Дерево":0,"Огонь":0,"Земля":0,"Металл":0,"Вода":0}
     for p in [year_p, month_p, day_p, hour_p]:
         e = p.get("element")
         if e in elements_count:
             elements_count[e] += 1
-
     dominant = max(elements_count, key=elements_count.get)
-
     return {
-        "year": year_p,
-        "month": month_p,
-        "day": day_p,
-        "hour": hour_p,
-        "elements_balance": elements_count,
-        "dominant_element": dominant
-    }
-
-# ─────────────────────────────────────────────
-# HUMAN DESIGN
-# ─────────────────────────────────────────────
-
-def get_hd_gate(lon):
-    """Градус эклиптики → ворота HD (1-64)"""
-    idx = int(lon / (360/64)) % 64
-    return HD_GATES[idx]
-
-def calc_human_design(year, month, day, hour, minute, lat, lon):
-    """Human Design — Тип, Профиль, ключевые ворота"""
-    y, mo, d, h = local_to_ut(year, month, day, hour, minute, lon)
-    jd = swe.julday(y, mo, d, h)
-    flag = swe.FLG_MOSEPH
-
-    # Дата Личности (момент рождения)
-    jd_personality = jd
-    # Дата Дизайна (≈88 дней до рождения)
-    jd_design = jd - 88.0
-
-    try:
-        sun_p, _ = swe.calc_ut(jd_personality, swe.SUN, flag)
-        moon_p, _ = swe.calc_ut(jd_personality, swe.MOON, flag)
-        sun_d, _ = swe.calc_ut(jd_design, swe.SUN, flag)
-        moon_d, _ = swe.calc_ut(jd_design, swe.MOON, flag)
-    except Exception as e:
-        return {"error": str(e)}
-
-    gate_sun_p = get_hd_gate(sun_p[0])
-    gate_moon_p = get_hd_gate(moon_p[0])
-    gate_sun_d = get_hd_gate(sun_d[0])
-    gate_moon_d = get_hd_gate(moon_d[0])
-
-    # Линия профиля — по позиции Солнца личности
-    line = int((sun_p[0] % (360/64)) / (360/64/6)) + 1
-    if line > 6:
-        line = 6
-
-    # Вторая линия профиля — Солнце Дизайна
-    line2 = int((sun_d[0] % (360/64)) / (360/64/6)) + 1
-    if line2 > 6:
-        line2 = 6
-
-    profile = f"{line}/{line2}"
-
-    # Тип — упрощённое определение по набору ворот
-    # В реальном HD тип определяется по центрам, здесь используем
-    # статистически наиболее вероятное распределение по позиции Солнца
-    sun_lon = sun_p[0]
-    if sun_lon < 90 or sun_lon >= 270:
-        hd_type = "Генератор"
-        strategy = "Ждать и реагировать"
-    elif 90 <= sun_lon < 150:
-        hd_type = "Проектор"
-        strategy = "Ждать приглашения"
-    elif 150 <= sun_lon < 210:
-        hd_type = "Манифестор"
-        strategy = "Информировать и действовать"
-    else:
-        hd_type = "Генератор-Манифестор"
-        strategy = "Ждать, затем действовать"
-
-    # Рефлектор — редко (~1%), не определяем автоматически
-
-    LINE_NAMES = {
-        1: "Исследователь", 2: "Отшельник", 3: "Мученик",
-        4: "Оппортунист", 5: "Еретик", 6: "Ролевая модель"
-    }
-
-    return {
-        "type": hd_type,
-        "strategy": strategy,
-        "profile": profile,
-        "profile_name": f"{LINE_NAMES.get(line,'')} / {LINE_NAMES.get(line2,'')}",
-        "gates": {
-            "sun_personality": gate_sun_p,
-            "moon_personality": gate_moon_p,
-            "sun_design": gate_sun_d,
-            "moon_design": gate_moon_d,
-        },
-        "note": "Базовый расчёт. Для полного HD (все центры и каналы) используй myhumandesign.ru"
+        "year": year_p, "month": month_p, "day": day_p, "hour": hour_p,
+        "elements_balance": elements_count, "dominant_element": dominant
     }
 
 # ─────────────────────────────────────────────
@@ -572,12 +512,10 @@ def calc_human_design(year, month, day, hour, minute, lat, lon):
 # ─────────────────────────────────────────────
 
 def calc_numerology(day, month, year, firstname="", lastname=""):
-    # Число жизненного пути
     digits = [int(d) for d in f"{day}{month}{year}"]
     lp_sum = sum(digits)
     lp, lp_steps = reduce_to_9(lp_sum, keep_master=True)
 
-    # Квадрат Пифагора
     date_str = f"{day:02d}{month:02d}{year}"
     date_digits = [int(c) for c in date_str]
     a = sum(date_digits)
@@ -591,12 +529,10 @@ def calc_numerology(day, month, year, firstname="", lastname=""):
         if x != 0:
             counts[x] = counts.get(x, 0) + 1
 
-    # Аркан Таро
     date_str2 = f"{day:02d}{month:02d}{year}"
     arcana_sum = sum(int(d) for d in date_str2)
     arcana = reduce_to_22(arcana_sum)
 
-    # Матрица судьбы
     A = reduce_to_22(day)
     B = reduce_to_22(month)
     C = reduce_to_22(sum(int(d) for d in str(year)))
@@ -607,10 +543,8 @@ def calc_numerology(day, month, year, firstname="", lastname=""):
     G = reduce_to_22(C + D)
     H = reduce_to_22(D + A)
 
-    # Знак зодиака
     zodiac = get_zodiac(day, month)
 
-    # Код имени
     name_codes = {}
     for label, text in [("Имя", firstname), ("Фамилия", lastname)]:
         if text:
@@ -619,31 +553,22 @@ def calc_numerology(day, month, year, firstname="", lastname=""):
             s = sum(CYRILLIC_PYTH[c] for c in letters)
             reduced, _ = reduce_to_9(s)
             name_codes[label] = {
-                "text": text,
-                "sum": s,
-                "reduced": reduced,
+                "text": text, "sum": s, "reduced": reduced,
                 "breakdown": " ".join(f"{c}={CYRILLIC_PYTH[c]}" for c in letters)
             }
 
     return {
-        "life_path": lp,
-        "life_path_sum": lp_sum,
-        "life_path_steps": lp_steps,
+        "life_path": lp, "life_path_sum": lp_sum, "life_path_steps": lp_steps,
         "pythagorean_square": {
             "working_numbers": [a, b, abs(c), d_num],
-            "destiny_number": a,
-            "soul_number": b,
-            "counts": counts
+            "destiny_number": a, "soul_number": b, "counts": counts
         },
-        "arcana": arcana,
-        "arcana_name": ARCANA_NAMES.get(arcana, ""),
+        "arcana": arcana, "arcana_name": ARCANA_NAMES.get(arcana, ""),
         "matrix_of_destiny": {
-            "A": A, "B": B, "C": C, "D": D,
-            "center": center,
+            "A": A, "B": B, "C": C, "D": D, "center": center,
             "E": E, "F": F, "G": G, "H": H
         },
-        "zodiac": zodiac,
-        "name_codes": name_codes
+        "zodiac": zodiac, "name_codes": name_codes
     }
 
 def get_zodiac(day, month):
@@ -679,7 +604,7 @@ def get_zodiac(day, month):
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({"status": "ok", "version": "1.0"})
+    return jsonify({"status": "ok", "version": "2.0-ephem"})
 
 @app.route('/geocode', methods=['POST'])
 def geocode_endpoint():
@@ -704,7 +629,6 @@ def calculate():
         firstname = data.get('firstname', '')
         lastname = data.get('lastname', '')
 
-        # Все расчёты
         numerology = calc_numerology(day, month, year, firstname, lastname)
         bazi = calc_bazi(year, month, day, hour, minute)
         natal = calc_natal(year, month, day, hour, minute, lat, lon)
@@ -729,7 +653,6 @@ def calculate():
 
 @app.route('/summary', methods=['POST'])
 def summary():
-    """Возвращает текстовую сводку для вставки в промпт Claude"""
     data = request.json
     try:
         day = int(data['day'])
@@ -813,21 +736,19 @@ def summary():
 
 @app.route('/generate', methods=['POST'])
 def generate_analysis():
-    """Генерация анализа через Claude API на основе сводки данных клиента"""
     data = request.json
     try:
         summary = data.get('summary', '')
         client_request = data.get('request', '')
-        tone = data.get('tone', 'sokolov')  # sokolov или rybin
         lang_instruction = data.get('lang_instruction', 'Отвечай на русском языке.')
 
         if not summary:
             return jsonify({"status": "error", "message": "Нет данных для анализа"}), 400
 
-        if not ANTHROPIC_API_KEY or ANTHROPIC_API_KEY == "ВСТАВЬ_КЛЮЧ_ЗДЕСЬ":
+        api_key = ANTHROPIC_API_KEY
+        if not api_key:
             return jsonify({"status": "error", "message": "API ключ не установлен"}), 400
 
-        # Системный промпт — стиль AION Vi
         system_prompt = """Ты — AION Vi, персональный навигатор судьбы. Ты анализируешь человека через многомерную призму и говоришь с ним как мудрый проводник, который видит его насквозь.
 
 СТИЛЬ И ПОДАЧА:
@@ -852,21 +773,15 @@ def generate_analysis():
 
 ВАЖНО: {lang_instruction}"""
 
-        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        client = anthropic.Anthropic(api_key=api_key)
         message = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=2000,
-            messages=[
-                {
-                    "role": "user",
-                    "content": user_prompt
-                }
-            ],
+            messages=[{"role": "user", "content": user_prompt}],
             system=system_prompt
         )
 
         analysis_text = message.content[0].text
-
         return jsonify({
             "status": "ok",
             "analysis": analysis_text,
@@ -882,10 +797,10 @@ def generate_analysis():
 
 if __name__ == '__main__':
     print("=" * 50)
-    print("  Код Жизни — сервер расчётов")
+    print("  AION Vi — сервер расчётов v2.0")
     print("  http://localhost:5050")
     print("  Нажми Ctrl+C для остановки")
     print("=" * 50)
-    import os
+
 port = int(os.environ.get('PORT', 5050))
 app.run(host='0.0.0.0', port=port)
