@@ -717,13 +717,23 @@ def generate_pdf():
         if weasyprint_available:
             from weasyprint import HTML
             from flask import Response
+            from urllib.parse import quote
             pdf_bytes = HTML(string=html_content).write_pdf()
-            filename = f"AION_Vi_{name.replace(' ', '_')}_{birthdate.replace('.', '-')}.pdf"
+
+            # Имя файла может быть на кириллице — в HTTP-заголовках напрямую
+            # так писать нельзя (только латиница). Поэтому: делаем безопасное
+            # ASCII-имя для старых программ + правильно закодированное
+            # кириллическое имя (RFC 5987) для всех современных браузеров —
+            # пользователь увидит файл с нормальным русским/украинским именем.
+            raw_filename = f"AION_Vi_{name.replace(' ', '_')}_{birthdate.replace('.', '-')}.pdf"
+            ascii_fallback = "AION_Vi_analysis.pdf"
+            encoded_filename = quote(raw_filename)
+
             return Response(
                 pdf_bytes,
                 mimetype='application/pdf',
                 headers={
-                    'Content-Disposition': f'attachment; filename="{filename}"',
+                    'Content-Disposition': f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{encoded_filename}",
                     'Content-Type': 'application/pdf'
                 }
             )
