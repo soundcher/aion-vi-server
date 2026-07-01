@@ -653,7 +653,8 @@ def generate_pdf():
     font-family: 'AION Sans', 'DejaVu Sans', 'Liberation Sans', Arial, sans-serif;
     background: #f2ecdd;
     color: #3a332b;
-    margin: 0; padding: 0;
+    margin: 0;
+    padding: 10mm 12mm;
     font-size: 13px;
     line-height: 1.9;
   }}
@@ -705,7 +706,7 @@ def generate_pdf():
 <body>
 <div class="header">
   <div class="brand">AION Vi</div>
-  <div class="sub">Персональный навигатор судьбы</div>
+  <div class="sub">Персональный навигатор</div>
   <div class="client-name">{name}</div>
   <div class="client-date">{birthdate}</div>
 </div>
