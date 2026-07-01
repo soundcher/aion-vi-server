@@ -625,15 +625,32 @@ def generate_pdf():
         except ImportError:
             weasyprint_available = False
 
+        # Путь к папке со шрифтами (лежит рядом с server.py, в самом проекте)
+        # Так шрифт с кириллицей гарантированно есть, независимо от того,
+        # что установлено на сервере Railway.
+        FONTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fonts')
+        font_regular_path = os.path.join(FONTS_DIR, 'DejaVuSans.ttf').replace('\\', '/')
+        font_bold_path = os.path.join(FONTS_DIR, 'DejaVuSans-Bold.ttf').replace('\\', '/')
+
         # HTML шаблон PDF
         html_content = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
 <style>
+  @font-face {{
+    font-family: 'AION Sans';
+    src: url('file://{font_regular_path}') format('truetype');
+    font-weight: normal;
+  }}
+  @font-face {{
+    font-family: 'AION Sans';
+    src: url('file://{font_bold_path}') format('truetype');
+    font-weight: bold;
+  }}
   @page {{ margin: 20mm 18mm; }}
   body {{
-    font-family: 'DejaVu Sans', 'Liberation Sans', Arial, sans-serif;
+    font-family: 'AION Sans', 'DejaVu Sans', 'Liberation Sans', Arial, sans-serif;
     background: #f2ecdd;
     color: #3a332b;
     margin: 0; padding: 0;
