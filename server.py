@@ -862,6 +862,7 @@ def calculate():
             "status": "ok",
             "input": {
                 "name": f"{firstname} {lastname}".strip(),
+                "gender": data.get('gender', ''),
                 "date": f"{day:02d}.{month:02d}.{year}",
                 "time": f"{hour:02d}:{minute:02d}",
                 "lat": lat, "lon": lon
@@ -887,6 +888,7 @@ def summary():
         lon = float(data.get('lon', 30.52))
         firstname = data.get('firstname', '')
         lastname = data.get('lastname', '')
+        gender = data.get('gender', '')
         client_request = data.get('request', '')
 
         num = calc_numerology(day, month, year, firstname, lastname)
@@ -896,6 +898,8 @@ def summary():
 
         lines = []
         lines.append(f"КЛИЕНТ: {firstname} {lastname}".strip())
+        if gender in ('m', 'f'):
+            lines.append(f"ПОЛ: {'мужской (обращайся в мужском роде)' if gender == 'm' else 'женский (обращайся в женском роде)'}")
         lines.append(f"ДАТА РОЖДЕНИЯ: {day:02d}.{month:02d}.{year}")
         
         # Точный возраст
