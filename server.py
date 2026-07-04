@@ -689,6 +689,49 @@ def health():
     return jsonify({"status": "ok", "version": "2.0-ephem"})
 
 
+# ── Промокоды — теперь только на сервере, не видны в исходнике страницы ──
+VALID_CODES = [
+    'AION-GXV-2080','AION-JGQ-0832','AION-SDR-9002','AION-PLJ-2148','AION-MWM-1423',
+    'AION-WZQ-3123','AION-VUR-3083','AION-NML-6099','AION-QSG-1716','AION-GUW-6887',
+    'AION-GDA-0293','AION-XXX-2791','AION-EHF-0821','AION-LXW-9440','AION-BXP-6304',
+    'AION-IZH-8028','AION-MPW-3485','AION-VHT-0181','AION-PBL-5301','AION-JLE-2324',
+    'AION-KSQ-6406','AION-PMY-4592','AION-ALU-3105','AION-VVS-7597','AION-OIU-5848',
+    'AION-ILD-8534','AION-WVJ-0006','AION-MPL-1905','AION-KKU-9413','AION-ZAD-2600',
+    'AION-XTV-7917','AION-VTT-1197','AION-FEY-7893','AION-SKN-0009','AION-JTA-8187',
+    'AION-BNA-2831','AION-QTN-8910','AION-IZU-9276','AION-EWV-2766','AION-RTY-6131',
+    'AION-DYJ-8051','AION-AUH-6315','AION-PVW-0891','AION-CDZ-9473','AION-JCL-5503',
+    'AION-MIC-7411','AION-IMH-6949','AION-RVX-8930','AION-BQY-1478','AION-CDG-4810'
+]
+
+@app.route('/redeem', methods=['POST'])
+def redeem():
+    data = request.json or {}
+    code = (data.get('code') or '').strip().upper()
+
+    if not code:
+        return jsonify({"valid": False, "reason": "empty"}), 400
+    if code not in VALID_CODES:
+        return jsonify({"valid": False, "reason": "not_found"}), 404
+    if not firebase_db_available:
+        return jsonify({"valid": False, "reason": "service_unavailable"}), 503
+
+    try:
+        ref = fb_db.reference(f'used_codes/{code}')
+        # Атомарно: помечаем использованным, только если ещё не был использован
+        result = {"already_used": False}
+        def txn(current):
+            if current:
+                result["already_used"] = True
+                return current  # не меняем — код уже занят
+            return True
+        ref.transaction(txn)
+        if result["already_used"]:
+            return jsonify({"valid": False, "reason": "used"}), 409
+        return jsonify({"valid": True})
+    except Exception as e:
+        return jsonify({"valid": False, "reason": "error"}), 500
+
+
 @app.route('/generate-pdf', methods=['POST'])
 def generate_pdf():
     """Генерирует PDF файл с анализом через WeasyPrint"""
@@ -969,6 +1012,9 @@ def summary():
 
 @app.route('/quick-profile', methods=['POST'])
 def quick_profile():
+    # Заморожено: фронтенд эту фичу пока не вызывает (экономия токенов на бете).
+    # Эндпоинт временно закрыт, чтобы им нельзя было пользоваться напрямую в обход кассы.
+    return jsonify({"status": "error", "message": "Функция временно отключена"}), 503
     data = request.json
     try:
         nickname = data.get('nickname', '')
@@ -1043,17 +1089,27 @@ def generate_analysis():
         if not summary:
             return jsonify({"status": "error", "message": "Нет данных для анализа"}), 400
 
-        # ── Касса на сервере: проверяем остаток ДО вызова Claude API ──
-        # (без этого пользователь мог бы подделать счётчик в браузере
-        # и генерировать анализы бесплатно за наш счёт)
+        # ── Касса на сервере: обязательна, без email или без связи с базой — отказ ──
+        # (раньше отсутствие email просто пропускало проверку — дыра, через
+        # которую можно было генерировать бесплатно за наш счёт)
         email = data.get('email', '')
-        if firebase_db_available and email:
-            left = get_analyses_left(email)
-            if left is not None and left <= 0:
-                return jsonify({
-                    "status": "error",
-                    "message": "Анализы на этом пакете закончились. Продолжи с новым пакетом."
-                }), 403
+        if not email:
+            return jsonify({"status": "error", "message": "Не удалось определить пользователя. Перезайди в аккаунт."}), 403
+        if not firebase_db_available:
+            return jsonify({"status": "error", "message": "Сервис временно недоступен, попробуй через минуту."}), 503
+
+        left = get_analyses_left(email)
+        is_unlimited = False
+        try:
+            key = email_to_key(email)
+            is_unlimited = bool(fb_db.reference(f'users/{key}/unlimited').get())
+        except Exception:
+            pass
+        if not is_unlimited and left is not None and left <= 0:
+            return jsonify({
+                "status": "error",
+                "message": "Анализы на этом пакете закончились. Продолжи с новым пакетом."
+            }), 403
 
         api_key = ANTHROPIC_API_KEY
         if not api_key:
@@ -1141,10 +1197,11 @@ def generate_analysis():
 
         analysis_text = message.content[0].text
 
-        # Списываем анализ только при успехе — неудачная генерация не в счёт
+        # Списываем анализ только при успехе, и только если не безлимитный
         new_left = None
         if firebase_db_available and email:
-            decrement_analysis(email)
+            if not is_unlimited:
+                decrement_analysis(email)
             new_left = get_analyses_left(email)
 
         return jsonify({
