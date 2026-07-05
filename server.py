@@ -703,6 +703,35 @@ VALID_CODES = [
     'AION-MIC-7411','AION-IMH-6949','AION-RVX-8930','AION-BQY-1478','AION-CDG-4810'
 ]
 
+@app.route('/rate', methods=['POST'])
+def rate():
+    data = request.json or {}
+    rating = data.get('rating')
+    comment = (data.get('comment') or '').strip()[:2000]  # ограничение на длину
+    email = data.get('email', '')
+    compat = bool(data.get('compat', False))
+    theme = data.get('theme', '')
+
+    if not isinstance(rating, int) or not (1 <= rating <= 5):
+        return jsonify({"status": "error", "message": "invalid_rating"}), 400
+    if not firebase_db_available:
+        return jsonify({"status": "error", "message": "service_unavailable"}), 503
+
+    try:
+        ref = fb_db.reference('ratings').push()
+        ref.set({
+            "email": email,
+            "rating": rating,
+            "comment": comment,
+            "compat": compat,
+            "theme": theme,
+            "timestamp": datetime.now().isoformat()
+        })
+        return jsonify({"status": "ok"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": "save_failed"}), 500
+
+
 @app.route('/redeem', methods=['POST'])
 def redeem():
     data = request.json or {}
