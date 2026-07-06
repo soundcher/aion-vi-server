@@ -17,6 +17,33 @@ import os
 
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 
+# ── Детектор кризисных маркеров в запросе пользователя ──
+# Не номер телефона (он устаревает, мы это проверили на практике —
+# линия в Германии перестала работать за 5 дней) — просто честная
+# рекомендация обратиться к живому специалисту, если есть явные признаки.
+CRISIS_MARKERS = [
+    'не хочу жить', 'не вижу смысла жить', 'незачем жить', 'не понимаю, зачем живу',
+    'никому не нужна', 'никому не нужен', 'хочу умереть', 'покончить с собой',
+    'не хочу больше жить', 'нет сил жить',
+    'не хочу жити', 'не бачу сенсу жити', 'нема сенсу жити', 'не розумію, навіщо живу',
+    'нікому не потрібна', 'нікому не потрібен', 'хочу померти', 'покінчити з собою',
+    "don't want to live", 'no reason to live', 'want to die', 'kill myself',
+    'nie chcę żyć', 'nie widzę sensu', 'chcę umrzeć',
+]
+
+CRISIS_ADDENDUM = {
+    'Отвечай на русском языке.': "\n\n---\nТо, что ты сейчас написал(а), звучит по-настоящему тяжело. Пожалуйста, не оставайся с этим один(одна) — поговори с близким человеком или специалистом, который умеет помогать именно в такие моменты. Я готов быть рядом в разговоре, но не могу заменить живую поддержку, когда она нужна по-настоящему.",
+    'Відповідай українською мовою.': "\n\n---\nТе, що ти зараз написав(ла), звучить по-справжньому важко. Будь ласка, не залишайся з цим наодинці — поговори з близькою людиною або зі спеціалістом, який вміє допомагати саме в такі моменти. Я готовий бути поруч у розмові, але не можу замінити живу підтримку, коли вона потрібна по-справжньому.",
+    'Odpowiadaj po polsku.': "\n\n---\nTo, co właśnie napisałeś/aś, brzmi naprawdę ciężko. Proszę, nie zostawaj z tym sam(a) — porozmawiaj z bliską osobą lub specjalistą, który potrafi pomóc właśnie w takich chwilach. Chętnie porozmawiam, ale nie zastąpię prawdziwego wsparcia, gdy jest ono naprawdę potrzebne.",
+    'Respond in English.': "\n\n---\nWhat you just wrote sounds genuinely heavy. Please don't carry this alone — talk to someone close to you or a professional who knows how to help in moments like this. I'm glad to be here for the conversation, but I can't replace real support when it's truly needed.",
+}
+
+def detect_crisis(text):
+    if not text:
+        return False
+    lowered = text.lower()
+    return any(marker in lowered for marker in CRISIS_MARKERS)
+
 # ── Firebase Admin — "касса" анализов на сервере ──
 import base64
 import json as _json
@@ -1225,6 +1252,10 @@ def generate_analysis():
         )
 
         analysis_text = message.content[0].text
+
+        # Кризисные маркеры — добавляем честную приписку, без номеров телефонов
+        if detect_crisis(client_request):
+            analysis_text += CRISIS_ADDENDUM.get(lang_instruction, CRISIS_ADDENDUM['Отвечай на русском языке.'])
 
         # Списываем анализ только при успехе, и только если не безлимитный
         new_left = None
