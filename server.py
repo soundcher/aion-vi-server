@@ -552,26 +552,49 @@ def calc_human_design(year, month, day, hour, minute, lat, lon):
         line_d = min(6, int((sun_d % (360/64)) / (360/64/6)) + 1)
         profile = f"{line_p}/{line_d}"
 
+        # ── Definition: один, два или три "острова" определённых центров ──
+        # Строим граф связей между определёнными центрами через активные каналы
+        center_neighbors = {c: set() for c in defined_centers}
+        for (g1, g2), (c1, c2) in CHANNELS.items():
+            if c1 in defined_centers and c2 in defined_centers:
+                if g1 in all_gates and g2 in all_gates:
+                    center_neighbors[c1].add(c2)
+                    center_neighbors[c2].add(c1)
+
+        # Обход в ширину для подсчёта связных компонент (остовов)
+        visited = set()
+        components = 0
+        for start in defined_centers:
+            if start not in visited:
+                components += 1
+                queue = [start]
+                while queue:
+                    node = queue.pop()
+                    if node not in visited:
+                        visited.add(node)
+                        queue.extend(center_neighbors[node] - visited)
+
+        definition_map = {0: "Не определён", 1: "Single Definition",
+                          2: "Split Definition", 3: "Triple Split Definition"}
+        definition = definition_map.get(components, f"{components} Split")
+
     except Exception as e:
         return {"error": str(e)}
 
     LINE_NAMES = {
-        1:"Исследователь", 2:"Отшельник", 3:"Мученик",
-        4:"Оппортунист", 5:"Еретик", 6:"Ролевая модель"
+        1: "Исследователь", 2: "Отшельник", 3: "Мученик",
+        4: "Оппортунист",   5: "Еретик",    6: "Ролевая модель"
     }
 
     return {
         "type": hd_type,
         "strategy": strategy,
         "profile": profile,
-        "profile_name": f"{LINE_NAMES.get(line,'')} / {LINE_NAMES.get(line2,'')}",
-        "gates": {
-            "sun_personality": gate_sun_p,
-            "moon_personality": gate_moon_p,
-            "sun_design": gate_sun_d,
-            "moon_design": gate_moon_d,
-        },
-        "note": "Базовый расчёт. Для полного HD используй myhumandesign.ru"
+        "profile_name": f"{LINE_NAMES.get(line_p, '')} / {LINE_NAMES.get(line_d, '')}",
+        "definition": definition,
+        "defined_centers": sorted(defined_centers),
+        "channels": defined_channels,
+        "note": "Расчёт по 10 планетам и 36 каналам"
     }
 
 # ─────────────────────────────────────────────
@@ -692,6 +715,37 @@ def get_bazi_hour_pillar(year, month, day, hour, minute, day_stem_idx):
         "animal": ANIMALS_RU[branch_idx],
         "element": ELEMENTS_RU[stem_idx],
         "pillar": f"{STEMS_RU[stem_idx]}-{BRANCHES_RU[branch_idx]}"
+    }
+
+def calc_profection(age, month, day, birth_year):
+    """
+    Годовая профекция — простая, но мощная техника: каждый год жизни
+    подсвечивает определённую жизненную тему (цикл из 12 тем).
+    Возвращает уже человеческую формулировку темы, без терминов.
+    """
+    # Профекционный "дом" года: (возраст % 12) + 1, где дом 1 = возраст 0, 12, 24...
+    house = (age % 12) + 1
+
+    # Темы года — в живой формулировке, без астрологического жаргона.
+    # Каждая — про жизненный акцент этого года.
+    THEMES = {
+        1:  "год про тебя самого — твою личность, тело, новые начинания и то, каким ты хочешь быть дальше. Время заявить о себе.",
+        2:  "год про ресурсы и опору — деньги, самооценку, ощущение собственной ценности. Год, чтобы укрепить фундамент под ногами.",
+        3:  "год про общение, обучение, близкое окружение — братьев-сестёр, соседей, короткие поездки. Много контактов, информации, движения.",
+        4:  "год про дом, семью, корни, внутреннюю опору. Тянет обустраивать пространство, разбираться с прошлым, побыть 'у себя'.",
+        5:  "год про творчество, любовь, детей, удовольствие и самовыражение. Год, когда важно позволять себе радость и быть замеченным.",
+        6:  "год про работу, здоровье, быт и рутину. Время наводить порядок в делах и в теле, выстраивать полезные привычки.",
+        7:  "год про отношения и партнёрство — близкие связи, брак, союзы, а иногда и открытые конфликты. Год про то, с кем ты рядом.",
+        8:  "год про глубокие перемены, общие ресурсы, доверие и трансформацию. Год, где многое переворачивается, чтобы освободить место новому.",
+        9:  "год про горизонты — путешествия, учёбу, мировоззрение, поиск смысла. Тянет расширяться, выходить за привычные рамки.",
+        10: "год про дело жизни, карьеру, статус, публичность и достижения. Год, когда важно то, кем ты становишься в глазах мира.",
+        11: "год про друзей, команду, единомышленников, большие цели и надежды. Год про то, с кем ты строишь будущее.",
+        12: "год про завершения, отдых, внутреннюю работу, отпускание старого. Год-пауза перед новым циклом — важно восстановиться и подвести итоги.",
+    }
+
+    return {
+        "house": house,
+        "theme": THEMES[house],
     }
 
 def calc_bazi(year, month, day, hour, minute):
@@ -1107,6 +1161,13 @@ def summary():
         lines.append(f"ТОЧНЫЙ ВОЗРАСТ: {age} лет (на сегодня {today.strftime('%d.%m.%Y')})")
         lines.append(f"ВРЕМЯ: {hour:02d}:{minute:02d}")
         lines.append(f"МЕСТО: широта {lat}, долгота {lon}")
+
+        # Годовая профекция — тема текущего года жизни
+        prof = calc_profection(age, month, day, year)
+        lines.append("")
+        lines.append(f"АКЦЕНТ ТЕКУЩЕГО ГОДА ЖИЗНИ: {prof['theme']}")
+        lines.append("(Это фоновая тема года. Упомяни её органично и своими словами, ТОЛЬКО если она естественно ложится в запрос человека или в общую картину. НЕ притягивай насильно, не называй это 'профекцией' или любым термином — просто как наблюдение о том, чем сейчас 'дышит' его год.)")
+
         if client_request:
             lines.append(f"ЗАПРОС: {client_request}")
         lines.append("")
