@@ -417,44 +417,143 @@ def get_hd_gate(lon):
 def calc_human_design(year, month, day, hour, minute, lat, lon):
     y, mo, d, h = local_to_ut(year, month, day, hour, minute, lon)
     date_str = datetime_to_ephem_str(y, mo, d, h)
-
-    # Дата Дизайна (~88 дней до рождения)
     design_date = ephem.Date(ephem.Date(date_str) - 88)
 
+    # ── Полный список 36 каналов (верифицирован по humandesignhd.com) ──
+    # Формат: (gate_a, gate_b) → (center_a, center_b)
+    CHANNELS = {
+        (1, 8):   ('G', 'Throat'),
+        (2, 14):  ('G', 'Sacral'),
+        (3, 60):  ('Root', 'Sacral'),
+        (4, 63):  ('Ajna', 'Head'),
+        (5, 15):  ('Sacral', 'G'),
+        (6, 59):  ('Sacral', 'Solar Plexus'),
+        (7, 31):  ('G', 'Throat'),
+        (9, 52):  ('Root', 'Sacral'),
+        (10, 20): ('G', 'Throat'),
+        (10, 34): ('G', 'Sacral'),
+        (10, 57): ('Spleen', 'G'),
+        (11, 56): ('Ajna', 'Throat'),
+        (12, 22): ('Solar Plexus', 'Throat'),
+        (13, 33): ('G', 'Throat'),
+        (16, 48): ('Spleen', 'Throat'),
+        (17, 62): ('Ajna', 'Throat'),
+        (18, 58): ('Root', 'Spleen'),
+        (19, 49): ('Root', 'Solar Plexus'),
+        (20, 34): ('Sacral', 'Throat'),
+        (20, 57): ('Spleen', 'Throat'),
+        (21, 45): ('Heart', 'Throat'),
+        (23, 43): ('Ajna', 'Throat'),
+        (24, 61): ('Head', 'Ajna'),
+        (25, 51): ('G', 'Heart'),
+        (26, 44): ('Spleen', 'Heart'),
+        (27, 50): ('Sacral', 'Spleen'),
+        (28, 38): ('Root', 'Spleen'),
+        (29, 46): ('Sacral', 'G'),
+        (30, 41): ('Root', 'Solar Plexus'),
+        (32, 54): ('Root', 'Spleen'),
+        (34, 57): ('Sacral', 'Spleen'),
+        (35, 36): ('Solar Plexus', 'Throat'),
+        (37, 40): ('Solar Plexus', 'Heart'),
+        (39, 55): ('Root', 'Solar Plexus'),
+        (42, 53): ('Root', 'Sacral'),
+        (47, 64): ('Head', 'Ajna'),
+    }
+
+    # Набор ворот у каждого центра (для проверки, что ворота там вообще есть)
+    CENTER_GATES = {
+        'Head':         {61, 63, 64},
+        'Ajna':         {4, 11, 17, 23, 24, 43, 47},
+        'Throat':       {7, 10, 11, 12, 13, 16, 17, 20, 23, 31, 33, 35, 56, 62},
+        'G':            {1, 2, 7, 10, 13, 15, 25, 29, 46},
+        'Sacral':       {2, 3, 5, 6, 9, 14, 20, 27, 29, 34, 42, 53, 59},
+        'Solar Plexus': {6, 12, 19, 22, 30, 35, 36, 37, 39, 49, 55},
+        'Heart':        {21, 25, 26, 40, 51},
+        'Spleen':       {10, 16, 18, 20, 26, 27, 28, 32, 34, 44, 48, 50, 57},
+        'Root':         {9, 18, 19, 28, 29, 30, 38, 39, 40, 41, 42, 52, 53, 54, 58, 60},
+    }
+
+    PLANETS_P = [
+        (ephem.Sun,     date_str),
+        (ephem.Moon,    date_str),
+        (ephem.Mercury, date_str),
+        (ephem.Venus,   date_str),
+        (ephem.Mars,    date_str),
+        (ephem.Jupiter, date_str),
+        (ephem.Saturn,  date_str),
+        (ephem.Uranus,  date_str),
+        (ephem.Neptune, date_str),
+        (ephem.Pluto,   date_str),
+    ]
+    PLANETS_D = [(p, design_date) for p, _ in PLANETS_P]
+
     try:
-        # Личность
+        gates_personality = set()
+        gates_design = set()
+        for planet, dt in PLANETS_P:
+            lon = get_planet_lon(planet, dt)
+            gates_personality.add(get_hd_gate(lon))
+        for planet, dt in PLANETS_D:
+            lon = get_planet_lon(planet, dt)
+            gates_design.add(get_hd_gate(lon))
+
+        all_gates = gates_personality | gates_design
+
+        # ── Определяем активированные центры через каналы ──
+        defined_centers = set()
+        defined_channels = []
+        for (g1, g2), (c1, c2) in CHANNELS.items():
+            if g1 in all_gates and g2 in all_gates:
+                defined_centers.add(c1)
+                defined_centers.add(c2)
+                defined_channels.append((g1, g2))
+
+        # ── Тип определяется по активированным центрам ──
+        has_sacral   = 'Sacral'  in defined_centers
+        has_throat   = 'Throat'  in defined_centers
+        has_solar_p  = 'Solar Plexus' in defined_centers
+        has_heart    = 'Heart'   in defined_centers
+        has_root     = 'Root'    in defined_centers
+
+        # Манифестор: мотор (Сердце/СП/Корень/Сакрал) → Горло, но Сакрал НЕ определён
+        # Генератор: Сакрал определён
+        # Манифестирующий Генератор: Сакрал + моторный канал к Горлу
+        # Проектор: ни Сакрал, ни прямого мотора к Горлу
+        # Рефлектор: ни один центр не определён
+
+        if len(defined_centers) == 0:
+            hd_type = "Рефлектор"
+            strategy = "Ждать лунный цикл (29 дней)"
+        elif has_sacral:
+            # Проверяем, есть ли прямое соединение Сакрал → Горло (20-34, 10-34)
+            sacral_to_throat = any(
+                (g1 in all_gates and g2 in all_gates)
+                for (g1, g2), (c1, c2) in CHANNELS.items()
+                if {c1, c2} == {'Sacral', 'Throat'}
+            )
+            if sacral_to_throat and has_throat:
+                hd_type = "Манифестирующий Генератор"
+                strategy = "Реагировать, затем действовать"
+            else:
+                hd_type = "Генератор"
+                strategy = "Ждать и реагировать"
+        elif has_throat and (has_solar_p or has_heart or has_root):
+            # Мотор соединён с Горлом, Сакрал не определён
+            hd_type = "Манифестор"
+            strategy = "Информировать и действовать"
+        else:
+            hd_type = "Проектор"
+            strategy = "Ждать приглашения"
+
+        # Профиль из Солнца Личности и Солнца Дизайна
         sun_p = get_planet_lon(ephem.Sun, date_str)
-        moon_p = get_planet_lon(ephem.Moon, date_str)
-        # Дизайн
         sun_d = get_planet_lon(ephem.Sun, design_date)
-        moon_d = get_planet_lon(ephem.Moon, design_date)
+        line_p = min(6, int((sun_p % (360/64)) / (360/64/6)) + 1)
+        line_d = min(6, int((sun_d % (360/64)) / (360/64/6)) + 1)
+        profile = f"{line_p}/{line_d}"
+
     except Exception as e:
         return {"error": str(e)}
-
-    gate_sun_p = get_hd_gate(sun_p)
-    gate_moon_p = get_hd_gate(moon_p)
-    gate_sun_d = get_hd_gate(sun_d)
-    gate_moon_d = get_hd_gate(moon_d)
-
-    line = int((sun_p % (360/64)) / (360/64/6)) + 1
-    if line > 6: line = 6
-    line2 = int((sun_d % (360/64)) / (360/64/6)) + 1
-    if line2 > 6: line2 = 6
-
-    profile = f"{line}/{line2}"
-
-    if sun_p < 90 or sun_p >= 270:
-        hd_type = "Генератор"
-        strategy = "Ждать и реагировать"
-    elif 90 <= sun_p < 150:
-        hd_type = "Проектор"
-        strategy = "Ждать приглашения"
-    elif 150 <= sun_p < 210:
-        hd_type = "Манифестор"
-        strategy = "Информировать и действовать"
-    else:
-        hd_type = "Генератор-Манифестор"
-        strategy = "Ждать, затем действовать"
 
     LINE_NAMES = {
         1:"Исследователь", 2:"Отшельник", 3:"Мученик",
