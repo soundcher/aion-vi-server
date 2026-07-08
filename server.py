@@ -718,6 +718,99 @@ def get_bazi_hour_pillar(year, month, day, hour, minute, day_stem_idx):
         "pillar": f"{STEMS_RU[stem_idx]}-{BRANCHES_RU[branch_idx]}"
     }
 
+def get_lahiri_ayanamsa(decimal_year):
+    """
+    Аянамша Лахири — сдвиг между тропическим и сидерическим зодиаком.
+    Формула проверена по нескольким источникам: J2000 база ~23.85°,
+    рост ~50.29 угл.секунды в год (прецессия равноденствий).
+    Для 2026 года даёт ~24.21° — сходится с эталонными таблицами.
+    """
+    return 23.85 + (decimal_year - 2000) * (50.29 / 3600)
+
+# Фиксированная последовательность управителей накшатр в Вимшоттари-даше
+DASHA_SEQUENCE = ['Кету', 'Венера', 'Солнце', 'Луна', 'Марс', 'Раху', 'Юпитер', 'Сатурн', 'Меркурий']
+DASHA_YEARS = {'Кету': 7, 'Венера': 20, 'Солнце': 6, 'Луна': 10, 'Марс': 7,
+               'Раху': 18, 'Юпитер': 16, 'Сатурн': 19, 'Меркурий': 17}
+
+# Темы периодов — человеческим языком, без терминов (тот же принцип, что и в профекциях)
+DASHA_THEMES = {
+    'Кету':     "период отпускания старого, внутреннего поиска и переосмысления — время меньше держаться за внешнее и больше прислушиваться к себе.",
+    'Венера':   "период отношений, удовольствия, красоты и творчества — время, когда важны близость, комфорт и то, что радует.",
+    'Солнце':   "период личной силы, признания и заявления о себе — время, когда важно быть увиденным и занять своё место.",
+    'Луна':     "период дома, чувств, заботы о себе и близких — время, когда эмоциональная опора важнее внешних достижений.",
+    'Марс':     "период действия, напора и отстаивания своего — время, когда энергия просит движения, а не ожидания.",
+    'Раху':     "период больших амбиций и нестандартных путей — время резких перемен и жажды большего, но с риском потерять почву под ногами.",
+    'Юпитер':   "период роста, удачи и расширения горизонтов — время, когда многое прибавляется: знания, возможности, смысл.",
+    'Сатурн':   "период дисциплины и настоящей, не быстрой работы — время, когда усилия не дают мгновенного результата, но закладывают прочный фундамент.",
+    'Меркурий': "период общения, обучения и новых связей — время, когда важны слова, сделки, обмен идеями и гибкость ума.",
+}
+
+def calc_vimshottari_dasha(year, month, day, hour, minute, lat, lon):
+    """
+    Определяет текущий (на сегодня) большой жизненный период по системе
+    Вимшоттари-даша — одной из самых распространённых техник ведической
+    астрологии. Основана на позиции Луны при рождении.
+    """
+    try:
+        y, mo, d, h = local_to_ut(year, month, day, hour, minute, lon)
+        date_str = datetime_to_ephem_str(y, mo, d, h)
+        moon_tropical = get_planet_lon(ephem.Moon, date_str)
+
+        decimal_birth_year = year + (month - 1) / 12 + day / 365.25
+        ayanamsa = get_lahiri_ayanamsa(decimal_birth_year)
+        moon_sidereal = (moon_tropical - ayanamsa) % 360
+
+        nakshatra_width = 360 / 27
+        nakshatra_index = int(moon_sidereal // nakshatra_width)
+        fraction_into = (moon_sidereal % nakshatra_width) / nakshatra_width
+
+        start_idx = nakshatra_index % 9
+        start_planet = DASHA_SEQUENCE[start_idx]
+        balance_years = DASHA_YEARS[start_planet] * (1 - fraction_into)
+
+        # Строим временную шкалу периодов от рождения вперёд
+        birth_date = datetime(year, month, day)
+        timeline = []
+        cursor = birth_date
+        end_of_first = cursor + timedelta(days=balance_years * 365.25)
+        timeline.append((start_planet, cursor, end_of_first))
+        cursor = end_of_first
+
+        idx = start_idx
+        today = datetime.now()
+        # Добавляем периоды, пока не перекроем сегодняшнюю дату с запасом
+        while cursor < today + timedelta(days=365 * 25):
+            idx = (idx + 1) % 9
+            planet = DASHA_SEQUENCE[idx]
+            period_end = cursor + timedelta(days=DASHA_YEARS[planet] * 365.25)
+            timeline.append((planet, cursor, period_end))
+            cursor = period_end
+            if len(timeline) > 15:  # защита от бесконечного цикла
+                break
+
+        # Ищем период, в который попадает сегодняшняя дата
+        current_planet = None
+        years_elapsed = 0
+        years_total = 0
+        for planet, start, end in timeline:
+            if start <= today < end:
+                current_planet = planet
+                years_elapsed = round((today - start).days / 365.25, 1)
+                years_total = DASHA_YEARS[planet]
+                break
+
+        if not current_planet:
+            return None  # не должно случиться, но подстрахуемся
+
+        return {
+            "planet": current_planet,
+            "theme": DASHA_THEMES[current_planet],
+            "years_elapsed": years_elapsed,
+            "years_total": years_total,
+        }
+    except Exception:
+        return None
+
 def calc_profection(age, month, day, birth_year):
     """
     Годовая профекция — простая, но мощная техника: каждый год жизни
@@ -1168,6 +1261,13 @@ def summary():
         lines.append("")
         lines.append(f"АКЦЕНТ ТЕКУЩЕГО ГОДА ЖИЗНИ: {prof['theme']}")
         lines.append("(Это фоновая тема года. Упомяни её органично и своими словами, ТОЛЬКО если она естественно ложится в запрос человека или в общую картину. НЕ притягивай насильно, не называй это 'профекцией' или любым термином — просто как наблюдение о том, чем сейчас 'дышит' его год.)")
+
+        # Крупный жизненный период (Вимшоттари-даша) — на сегодняшний день
+        dasha = calc_vimshottari_dasha(year, month, day, hour, minute, lat, lon)
+        if dasha:
+            lines.append("")
+            lines.append(f"КРУПНЫЙ ЖИЗНЕННЫЙ ПЕРИОД (сейчас, на {today.strftime('%d.%m.%Y')}): {dasha['theme']} (человек в этом периоде примерно {dasha['years_elapsed']} из {dasha['years_total']} лет)")
+            lines.append("(Это фоновый долгосрочный период — более крупный масштаб, чем акцент года выше. Упомяни ТОЛЬКО если органично ложится в запрос. НЕ называй это 'дашей' или любым системным термином — просто как наблюдение о более широкой фазе жизни, в которой сейчас находится человек.)")
 
         if client_request:
             lines.append(f"ЗАПРОС: {client_request}")
