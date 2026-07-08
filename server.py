@@ -11,6 +11,8 @@ from flask_cors import CORS
 import ephem
 import math
 import random
+import hmac
+import hashlib
 from datetime import datetime, timedelta
 import requests as http_requests
 import anthropic
@@ -976,6 +978,89 @@ VALID_CODES = [
     'AION-DYJ-8051','AION-AUH-6315','AION-PVW-0891','AION-CDZ-9473','AION-JCL-5503',
     'AION-MIC-7411','AION-IMH-6949','AION-RVX-8930','AION-BQY-1478','AION-CDG-4810'
 ]
+
+LEMONSQUEEZY_WEBHOOK_SECRET = os.environ.get('LEMONSQUEEZY_WEBHOOK_SECRET', '')
+
+# ── Тарифы — сопоставление названия варианта в Lemon Squeezy с пакетом ──
+# ВАЖНО: названия вариантов должны СОВПАДАТЬ с тем, как ты назовёшь их
+# при создании продуктов в Lemon Squeezy (регистр не важен, ищем по подстроке).
+TIER_MAP = {
+    'старт':    {'analyses': 8,  'tier': 'start'},
+    'start':    {'analyses': 8,  'tier': 'start'},
+    'базовый':  {'analyses': 15, 'tier': 'basic'},
+    'basic':    {'analyses': 15, 'tier': 'basic'},
+    'про':      {'analyses': 30, 'tier': 'pro'},
+    'pro':      {'analyses': 30, 'tier': 'pro'},
+}
+
+def match_tier(variant_name):
+    """Ищет тариф по названию варианта (частичное совпадение, без учёта регистра)."""
+    if not variant_name:
+        return None
+    lowered = variant_name.lower()
+    for key, tier_data in TIER_MAP.items():
+        if key in lowered:
+            return tier_data
+    return None
+
+@app.route('/webhooks/lemonsqueezy', methods=['POST'])
+def lemonsqueezy_webhook():
+    raw_body = request.get_data()  # ВАЖНО: сырое тело запроса, не data.json — нужно для проверки подписи
+
+    # ── Проверка подписи — без нужного секрета отказ, чтобы никто не мог подделать "оплату" ──
+    if not LEMONSQUEEZY_WEBHOOK_SECRET:
+        return jsonify({"status": "error", "message": "webhook_secret_not_configured"}), 500
+
+    signature = request.headers.get('X-Signature', '')
+    expected = hmac.new(
+        LEMONSQUEEZY_WEBHOOK_SECRET.encode('utf-8'),
+        raw_body,
+        hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return jsonify({"status": "error", "message": "invalid_signature"}), 401
+
+    try:
+        payload = _json.loads(raw_body)
+    except Exception:
+        return jsonify({"status": "error", "message": "invalid_json"}), 400
+
+    event_name = payload.get('meta', {}).get('event_name', '')
+    attrs = payload.get('data', {}).get('attributes', {})
+    user_email = attrs.get('user_email', '')
+    variant_name = attrs.get('variant_name', '') or attrs.get('product_name', '')
+    status = attrs.get('status', '')
+
+    if not user_email:
+        return jsonify({"status": "ok", "message": "no_email_skip"})  # отвечаем 200, чтобы LS не повторял
+
+    # ── Успешная оплата или активная подписка — выдаём пакет ──
+    if event_name in ('order_created', 'subscription_created', 'subscription_payment_success') \
+       and status in ('paid', 'active', 'on_trial'):
+        tier_data = match_tier(variant_name)
+        if tier_data and firebase_db_available:
+            try:
+                key = email_to_key(user_email)
+                fb_db.reference(f'users/{key}').update({
+                    'analysesLeft': tier_data['analyses'],
+                    'analysesTotal': tier_data['analyses'],
+                    'subscriptionTier': tier_data['tier'],
+                    'subscriptionStatus': 'active',
+                })
+            except Exception as e:
+                print(f"⚠️ Ошибка обновления после оплаты: {e}")
+
+    # ── Подписка отменена/истекла — просто помечаем статус, не отбираем остаток анализов ──
+    elif event_name in ('subscription_cancelled', 'subscription_expired'):
+        if firebase_db_available:
+            try:
+                key = email_to_key(user_email)
+                fb_db.reference(f'users/{key}').update({'subscriptionStatus': 'inactive'})
+            except Exception as e:
+                print(f"⚠️ Ошибка обновления при отмене: {e}")
+
+    return jsonify({"status": "ok"})
+
 
 @app.route('/rate', methods=['POST'])
 def rate():
