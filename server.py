@@ -1062,6 +1062,33 @@ def lemonsqueezy_webhook():
     return jsonify({"status": "ok"})
 
 
+@app.route('/history', methods=['POST'])
+def get_history():
+    data = request.json or {}
+    email = (data.get('email') or '').strip()
+    if not email:
+        return jsonify({"status": "error", "message": "no_email"}), 400
+    if not firebase_db_available:
+        return jsonify({"status": "error", "message": "service_unavailable"}), 503
+    try:
+        key = email_to_key(email)
+        raw = fb_db.reference(f'history/{key}').get() or {}
+        items = []
+        for _id, rec in raw.items():
+            if isinstance(rec, dict):
+                items.append({
+                    'createdAt': rec.get('createdAt', ''),
+                    'firstname': rec.get('firstname', ''),
+                    'lastname': rec.get('lastname', ''),
+                    'request': rec.get('request', ''),
+                    'analysis': rec.get('analysis', ''),
+                })
+        items.sort(key=lambda x: x['createdAt'], reverse=True)
+        return jsonify({"status": "ok", "items": items[:50]})
+    except Exception as e:
+        return jsonify({"status": "error", "message": "read_failed"}), 500
+
+
 @app.route('/rate', methods=['POST'])
 def rate():
     data = request.json or {}
@@ -1649,6 +1676,20 @@ def generate_analysis():
             if not is_unlimited:
                 decrement_analysis(email)
             new_left = get_analyses_left(email)
+
+            # ── История: сервер сохраняет сам, клиенту раздел недоступен напрямую ──
+            try:
+                key = email_to_key(email)
+                client_info = data.get('client_info', {}) or {}
+                fb_db.reference(f'history/{key}').push({
+                    'createdAt': datetime.now().isoformat(),
+                    'firstname': client_info.get('firstname', ''),
+                    'lastname': client_info.get('lastname', ''),
+                    'request': client_request or '',
+                    'analysis': analysis_text,
+                })
+            except Exception as e:
+                print(f"⚠️ Ошибка сохранения истории: {e}")
 
         return jsonify({
             "status": "ok",
