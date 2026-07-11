@@ -512,9 +512,23 @@ def find_transit_windows(natal_planets, days_ahead=60):
 # HUMAN DESIGN
 # ─────────────────────────────────────────────
 
+HD_WHEEL_START = 302.0  # Колесо Human Design начинается с 302° (2° Водолея = начало Ворот 41),
+                         # а не с 0° Овна. Без этого сдвига все ворота считались неверно.
+
 def get_hd_gate(lon):
-    idx = int(lon / (360/64)) % 64
+    shifted = (lon - HD_WHEEL_START) % 360
+    idx = int(shifted / (360/64)) % 64
     return HD_GATES[idx]
+
+def get_hd_gate_and_line(lon):
+    """Возвращает (номер ворот, номер линии 1-6) с учётом точки отсчёта колеса HD."""
+    gate_width = 360/64
+    shifted = (lon - HD_WHEEL_START) % 360
+    idx = int(shifted / gate_width) % 64
+    gate = HD_GATES[idx]
+    within_gate = shifted % gate_width
+    line = min(6, int(within_gate / (gate_width/6)) + 1)
+    return gate, line
 
 def calc_human_design(year, month, day, hour, minute, lat, lon):
     y, mo, d, h = local_to_ut(year, month, day, hour, minute, lon)
@@ -650,8 +664,13 @@ def calc_human_design(year, month, day, hour, minute, lat, lon):
         # Профиль из Солнца Личности и Солнца Дизайна
         sun_p = get_planet_lon(ephem.Sun, date_str)
         sun_d = get_planet_lon(ephem.Sun, design_date)
-        line_p = min(6, int((sun_p % (360/64)) / (360/64/6)) + 1)
-        line_d = min(6, int((sun_d % (360/64)) / (360/64/6)) + 1)
+        moon_p = get_planet_lon(ephem.Moon, date_str)
+        moon_d = get_planet_lon(ephem.Moon, design_date)
+
+        sun_p_gate, line_p = get_hd_gate_and_line(sun_p)
+        sun_d_gate, line_d = get_hd_gate_and_line(sun_d)
+        moon_p_gate, moon_p_line = get_hd_gate_and_line(moon_p)
+        moon_d_gate, moon_d_line = get_hd_gate_and_line(moon_d)
         profile = f"{line_p}/{line_d}"
 
         # ── Definition: один, два или три "острова" определённых центров ──
@@ -696,6 +715,12 @@ def calc_human_design(year, month, day, hour, minute, lat, lon):
         "definition": definition,
         "defined_centers": sorted(defined_centers),
         "channels": defined_channels,
+        "gates": {
+            "sun_personality": f"{sun_p_gate}.{line_p}",
+            "moon_personality": f"{moon_p_gate}.{moon_p_line}",
+            "sun_design": f"{sun_d_gate}.{line_d}",
+            "moon_design": f"{moon_d_gate}.{moon_d_line}",
+        },
         "note": "Расчёт по 10 планетам и 36 каналам"
     }
 
