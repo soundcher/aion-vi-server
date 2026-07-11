@@ -523,11 +523,16 @@ def get_hd_gate(lon):
 def get_hd_gate_and_line(lon):
     """Возвращает (номер ворот, номер линии 1-6) с учётом точки отсчёта колеса HD."""
     gate_width = 360/64
+    line_width = gate_width/6
     shifted = (lon - HD_WHEEL_START) % 360
     idx = int(shifted / gate_width) % 64
     gate = HD_GATES[idx]
     within_gate = shifted % gate_width
-    line = min(6, int(within_gate / (gate_width/6)) + 1)
+    # Сама сетка линий внутри ворот сдвинута на одну line_width относительно ворот
+    # (подтверждено сверкой с эталоном: Крест Инкарнации 3/50 | 41/31 — ворота совпали,
+    # линии были смещены ровно на +1 без этой калибровки).
+    line_position = (within_gate - line_width) % gate_width
+    line = int(line_position / line_width) + 1
     return gate, line
 
 def calc_human_design(year, month, day, hour, minute, lat, lon):
