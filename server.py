@@ -410,6 +410,105 @@ def calc_aspects(planets):
     return aspects
 
 # ─────────────────────────────────────────────
+# РЕАЛЬНЫЕ ТЕКУЩИЕ ТРАНЗИТЫ — честная замена придуманным датам.
+# Считаем настоящие положения планет "сейчас" (или на любую дату)
+# и сравниваем их с натальными точками человека. Та же техника ephem,
+# что и для натальной карты — просто вторая дата не рождение, а сегодня.
+# ─────────────────────────────────────────────
+
+TRANSIT_ASPECT_TYPES = {
+    0:   ("Соединение", 2.0),
+    60:  ("Секстиль",   1.5),
+    90:  ("Квадратура", 2.0),
+    120: ("Трин",       2.0),
+    180: ("Оппозиция",  2.0),
+}
+
+def calc_current_transits(natal_planets, target_date=None):
+    """
+    Считает реальные положения планет на target_date (готовая ephem-строка)
+    и сравнивает с натальными точками человека (natal_planets = calc_natal(...)['planets']).
+    Возвращает список активных совпадений с точным орбом (чем меньше орб —
+    тем точнее совпадение прямо в эту дату).
+    """
+    if target_date is None:
+        now = datetime.utcnow()
+        date_str = datetime_to_ephem_str(now.year, now.month, now.day, 12.0)
+    else:
+        date_str = target_date
+
+    transits = []
+    for t_name, t_class in EPHEM_PLANETS.items():
+        try:
+            t_lon = get_planet_lon(t_class, date_str)
+        except Exception:
+            continue
+        for n_name, n_data in natal_planets.items():
+            if "lon" not in n_data:
+                continue
+            n_lon = n_data["lon"]
+            diff = abs(t_lon - n_lon)
+            if diff > 180:
+                diff = 360 - diff
+            for angle, (aspect_name, orb) in TRANSIT_ASPECT_TYPES.items():
+                exact_orb = abs(diff - angle)
+                if exact_orb <= orb:
+                    transits.append({
+                        "transit_planet": t_name,
+                        "natal_planet": n_name,
+                        "aspect": aspect_name,
+                        "orb": round(exact_orb, 2),
+                    })
+    transits.sort(key=lambda x: x["orb"])
+    return transits
+
+
+def find_transit_windows(natal_planets, days_ahead=60):
+    """
+    Сканирует ближайшие days_ahead дней и находит РЕАЛЬНЫЕ даты, когда
+    транзитная планета входит в точный орб к натальной точке человека.
+    Возвращает список конкретных окон — начало, конец, дата пика точности.
+    Это и есть настоящая замена придуманным числам: цифры посчитаны, не выдуманы.
+    """
+    today = datetime.utcnow().date()
+    daily_hits = {}
+
+    for offset in range(days_ahead + 1):
+        day = today + timedelta(days=offset)
+        date_str = datetime_to_ephem_str(day.year, day.month, day.day, 12.0)
+        hits = calc_current_transits(natal_planets, target_date=date_str)
+        for h in hits:
+            key = (h["transit_planet"], h["natal_planet"], h["aspect"])
+            daily_hits.setdefault(key, []).append((day, h["orb"]))
+
+    windows = []
+    for key, points in daily_hits.items():
+        t_name, n_name, aspect = key
+        points.sort(key=lambda x: x[0])
+        start = prev_day = best_day = points[0][0]
+        best_orb = points[0][1]
+        for day, orb in points[1:]:
+            if (day - prev_day).days > 1:
+                windows.append({
+                    "transit_planet": t_name, "natal_planet": n_name, "aspect": aspect,
+                    "start": start.strftime('%d.%m.%Y'), "end": prev_day.strftime('%d.%m.%Y'),
+                    "peak": best_day.strftime('%d.%m.%Y'), "peak_orb": round(best_orb, 2),
+                })
+                start, best_orb, best_day = day, orb, day
+            elif orb < best_orb:
+                best_orb, best_day = orb, day
+            prev_day = day
+        windows.append({
+            "transit_planet": t_name, "natal_planet": n_name, "aspect": aspect,
+            "start": start.strftime('%d.%m.%Y'), "end": prev_day.strftime('%d.%m.%Y'),
+            "peak": best_day.strftime('%d.%m.%Y'), "peak_orb": round(best_orb, 2),
+        })
+
+    windows.sort(key=lambda w: w["peak_orb"])
+    return windows
+
+
+# ─────────────────────────────────────────────
 # HUMAN DESIGN
 # ─────────────────────────────────────────────
 
@@ -1442,6 +1541,15 @@ def summary():
             for cat_id in markers:
                 lines.append(f"— {MARKER_CATEGORIES[cat_id]}")
             lines.append("(Раз это подтверждено сразу двумя расчётами — можешь говорить об этом увереннее и весомее, чем об остальных фоновых темах, но только если это релевантно запросу человека. По-прежнему НЕ называй методы или системные термины — просто говори с большей убеждённостью об этой сфере жизни.)")
+
+        # РЕАЛЬНЫЕ ближайшие окна — посчитанные даты, не придуманные
+        transit_windows = find_transit_windows(nat.get('planets', {}), days_ahead=60)
+        if transit_windows:
+            lines.append("")
+            lines.append("РЕАЛЬНЫЕ БЛИЖАЙШИЕ ОКНА (посчитано математически на 60 дней вперёд — это НЕ придуманные даты):")
+            for w in transit_windows[:5]:
+                lines.append(f"— {w['start']}–{w['end']} (точнее всего {w['peak']})")
+            lines.append("(Если человек спрашивает 'когда' — используй ТОЛЬКО эти реальные даты, не придумывай другие. Формулируй по-человечески: 'ближе к концу июля', конкретные числа — но без слов 'транзит', 'аспект', названий планет.)")
 
         if client_request:
             lines.append(f"ЗАПРОС: {client_request}")
