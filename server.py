@@ -1943,6 +1943,127 @@ def generate_analysis():
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
+@app.route('/monthly-digest', methods=['POST'])
+def monthly_digest():
+    """
+    'Обзор месяца' — ленивая генерация раз в календарный месяц на человека.
+    Фронтенд дёргает этот эндпоинт при заходе в приложение.
+    Если для текущего месяца обзор уже был — отдаём его же (isNew=False, повторно не генерируем,
+    не тратим токены и деньги зря). Если это первый заход в новом месяце — считаем натальные данные,
+    реальные окна ИМЕННО на этот месяц (не на 60 дней вперёд, как в /summary — здесь только текущий
+    месяц), просим Claude собрать это в тёплый связный текст, сохраняем в ту же историю, что уже
+    видна в приложении (ничего нового в интерфейсе строить не нужно), и возвращаем isNew=True,
+    чтобы фронтенд показал баннер "Готов обзор месяца".
+    """
+    data = request.json
+    try:
+        email = data.get('email', '')
+        if not firebase_db_available or not email:
+            return jsonify({"status": "error", "message": "Не настроено хранилище"}), 400
+
+        key = email_to_key(email)
+        now = datetime.now()
+        month_key = now.strftime('%Y-%m')
+
+        marker_ref = fb_db.reference(f'monthly_digest_marker/{key}')
+        existing_month = marker_ref.get()
+
+        if existing_month == month_key:
+            cached = fb_db.reference(f'monthly_digest_cache/{key}').get() or {}
+            return jsonify({
+                "status": "ok",
+                "isNew": False,
+                "analysis": cached.get('analysis', ''),
+                "month": month_key
+            })
+
+        year = data.get('year')
+        month = data.get('month')
+        day = data.get('day')
+        hour = data.get('hour', 12)
+        minute = data.get('minute', 0)
+        lat = data.get('lat')
+        lon = data.get('lon')
+        lang_instruction = data.get('lang_instruction', 'Отвечай на русском языке.')
+
+        err = validate_birth_data(data)
+        if err:
+            return jsonify({"status": "error", "message": err}), 400
+
+        nat = calc_natal(year, month, day, hour, minute, lat, lon)
+        age = now.year - year - ((now.month, now.day) < (month, day))
+        prof = calc_profection(age, month, day, year)
+        dasha = calc_vimshottari_dasha(year, month, day, hour, minute, lat, lon)
+
+        transit_windows = find_transit_windows(nat.get('planets', {}), days_ahead=45)
+        this_month_windows = [
+            w for w in transit_windows
+            if datetime.strptime(w['peak'], '%d.%m.%Y').strftime('%Y-%m') == month_key
+        ]
+
+        lines = [f"АКЦЕНТ ГОДА: {prof['theme']}"]
+        if dasha:
+            lines.append(f"КРУПНЫЙ ПЕРИОД: {dasha['theme']}")
+        if this_month_windows:
+            lines.append("РЕАЛЬНЫЕ ОКНА ЭТОГО МЕСЯЦА (посчитано, не придумано):")
+            for w in this_month_windows:
+                lines.append(f"— {w['start']}–{w['end']} (точнее всего {w['peak']})")
+        else:
+            lines.append("В этом месяце нет точных совпадений в ближайших планетных окнах — "
+                          "НЕ придумывай их, честно строй обзор на фоновой теме года/периода выше.")
+        data_block = "\n".join(lines)
+
+        system_prompt = f"""Ты — AION Vi, тёплый близкий друг и советчик человека. Раз в месяц ты \
+присылаешь короткий личный обзор — не отчёт, а живое письмо другу о том, что несёт этот месяц.
+
+СТРОГО ЗАПРЕЩЕНО называть системы, планеты, знаки зодиака, астрологические/нумерологические \
+термины — только смысл, простыми словами.
+ЗАПРЕЩЕНО придумывать даты, которых нет в данных ниже.
+Пиши 150–250 слов. Тепло, конкретно, без общих фраз. Заверши одной ясной мыслью — на что обратить \
+внимание в этом месяце.
+{lang_instruction}"""
+
+        user_prompt = f"Данные месяца:\n{data_block}\n\nНапиши обзор месяца для этого человека."
+
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        message = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=800,
+            messages=[{"role": "user", "content": user_prompt}],
+            system=system_prompt
+        )
+        analysis_text = message.content[0].text
+
+        marker_ref.set(month_key)
+        fb_db.reference(f'monthly_digest_cache/{key}').set({
+            'analysis': analysis_text,
+            'month': month_key,
+            'createdAt': now.isoformat(),
+        })
+        client_info = data.get('client_info', {}) or {}
+        fb_db.reference(f'history/{key}').push({
+            'createdAt': now.isoformat(),
+            'firstname': client_info.get('firstname', ''),
+            'lastname': client_info.get('lastname', ''),
+            'request': 'Огляд місяця',
+            'analysis': analysis_text,
+        })
+
+        return jsonify({
+            "status": "ok",
+            "isNew": True,
+            "analysis": analysis_text,
+            "month": month_key
+        })
+
+    except anthropic.AuthenticationError:
+        return jsonify({"status": "error", "message": "Неверный API ключ"}), 401
+    except anthropic.RateLimitError:
+        return jsonify({"status": "error", "message": "Превышен лимит запросов, подожди минуту"}), 429
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 if __name__ == '__main__':
     print("=" * 50)
     print("  AION Vi — сервер расчётов v2.0")
