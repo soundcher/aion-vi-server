@@ -1720,7 +1720,13 @@ def generate_analysis():
         lang_instruction = data.get('lang_instruction', 'Отвечай на русском языке.')
         compat_enabled = data.get('compat_enabled', False)
         compat_theme = data.get('compat_theme', '')
-        compat_summary = data.get('compat_summary', '')
+        # Новый формат — массив участников [{name, summary}, ...] (2-4 человека).
+        # Старое поле compat_summary оставляем как запасной путь на случай,
+        # если где-то ещё дёргается старая версия фронтенда.
+        compat_summaries = data.get('compat_summaries', [])
+        legacy_compat_summary = data.get('compat_summary', '')
+        if not compat_summaries and legacy_compat_summary:
+            compat_summaries = [{'name': '', 'summary': legacy_compat_summary}]
         no_time = data.get('no_time', False)
         nickname = data.get('nickname', '')
         answer_mode = data.get('answer_mode', 'deep')  # deep | quick
@@ -1795,8 +1801,29 @@ def generate_analysis():
         if not api_key:
             return jsonify({"status": "error", "message": "API ключ не установлен"}), 400
 
-        if compat_enabled and compat_summary:
-            system_prompt = """Ты — AION Vi, персональный навигатор судьбы. Ты говоришь ИСКЛЮЧИТЕЛЬНО от первого лица. Ты анализируешь совместимость двух людей и говоришь как мудрый друг, который видит оба кода насквозь.
+        if compat_enabled and compat_summaries:
+            # ── Совместимость на 2-4 человек — блоки и формулировки строятся динамически ──
+            total_people = 1 + len(compat_summaries)
+            ordinals = ['ПЕРВЫЙ', 'ВТОРОЙ', 'ТРЕТИЙ', 'ЧЕТВЁРТЫЙ']
+            people_words = {2: 'двух людей', 3: 'трёх людей', 4: 'четырёх людей'}
+            people_word = people_words.get(total_people, f'{total_people} людей')
+
+            people_blocks = [f"{ordinals[0]} ЧЕЛОВЕК:\n{summary}"]
+            for i, person in enumerate(compat_summaries[:3], start=1):
+                people_blocks.append(f"{ordinals[i]} ЧЕЛОВЕК:\n{person.get('summary', '')}")
+            people_text = "\n\n".join(people_blocks)
+
+            if total_people == 2:
+                length_line = "— Длина: 800-1100 слов"
+                structure_line = "— Структура: кто первый → кто второй → точки резонанса → точки напряжения → общий потенциал → рекомендации"
+            elif total_people == 3:
+                length_line = "— Длина: 1100-1450 слов — на группу из трёх нужно больше места, чтобы раскрыть каждого не поверхностно"
+                structure_line = "— Структура: кратко каждый человек → точки резонанса между всеми → точки напряжения → общий потенциал группы → рекомендации"
+            else:
+                length_line = "— Длина: 1400-1800 слов — на группу из четырёх нужно больше места, чтобы раскрыть каждого не поверхностно"
+                structure_line = "— Структура: кратко каждый человек → точки резонанса между всеми → точки напряжения → общий потенциал группы → рекомендации"
+
+            system_prompt = f"""Ты — AION Vi, персональный навигатор судьбы. Ты говоришь ИСКЛЮЧИТЕЛЬНО от первого лица. Ты анализируешь совместимость {people_word} и говоришь как мудрый друг, который видит все коды насквозь.
 
 КРИТИЧЕСКИ ВАЖНО — ПЕРВОЕ ЛИЦО:
 — Ты НИКОГДА не говоришь о себе в третьем лице ("AION Vi видит", "AION Vi говорит")
@@ -1813,24 +1840,25 @@ def generate_analysis():
 — Вместо терминов: «код», «вибрация рождения», «космический отпечаток», «природная программа», «энергетический рисунок»
 — ДАТЫ: называй конкретные числа месяца ТОЛЬКО если они прямо даны в блоке "РЕАЛЬНЫЕ БЛИЖАЙШИЕ ОКНА" среди данных. Если блока нет — говори о времени качественно, без придуманных чисел.
 — Стиль: тёплый, личный, живой разговор, не отчёт
-— Обращайся к обоим по именам
-— Структура: кто первый → кто второй → точки резонанса → точки напряжения → общий потенциал → рекомендации
-— Длина: 800-1100 слов
+— Обращайся к каждому по имени
+{structure_line}
+{length_line}
 — Без заголовков (#), сплошным текстом с абзацами
-— Завершай мощной фразой-напутствием для обоих от первого лица"""
+— Завершай мощной фразой-напутствием для всех от первого лица"""
+
+            names_list = ", ".join(
+                [n for n in ([data.get('client_info', {}).get('firstname', '')] +
+                             [p.get('name', '') for p in compat_summaries]) if n]
+            )
 
             user_prompt = f"""АНАЛИЗ СОВМЕСТИМОСТИ — тема: {compat_theme}
 
-ПЕРВЫЙ ЧЕЛОВЕК:
-{summary}
-
-ВТОРОЙ ЧЕЛОВЕК:
-{compat_summary}
+{people_text}
 
 {f'Запрос клиента: {client_request}' if client_request else ''}
 {history_note}
 
-Напиши анализ совместимости от своего лица как AION Vi. Сравни коды обоих людей, найди резонансы и напряжения. Дай конкретные рекомендации для этих двух людей в контексте темы «{compat_theme}».
+Напиши анализ совместимости от своего лица как AION Vi. Сравни коды всех участников ({people_word}{': ' + names_list if names_list else ''}), найди резонансы и напряжения между всеми парами. Дай конкретные рекомендации для этой группы в контексте темы «{compat_theme}».
 
 ВАЖНО: {lang_instruction}{no_time_note}{nickname_note}"""
         else:
