@@ -1167,12 +1167,12 @@ LEMONSQUEEZY_WEBHOOK_SECRET = os.environ.get('LEMONSQUEEZY_WEBHOOK_SECRET', '')
 # ВАЖНО: названия вариантов должны СОВПАДАТЬ с тем, как ты назовёшь их
 # при создании продуктов в Lemon Squeezy (регистр не важен, ищем по подстроке).
 TIER_MAP = {
-    'старт':    {'analyses': 8,  'tier': 'start'},
-    'start':    {'analyses': 8,  'tier': 'start'},
-    'базовый':  {'analyses': 15, 'tier': 'basic'},
-    'basic':    {'analyses': 15, 'tier': 'basic'},
-    'про':      {'analyses': 30, 'tier': 'pro'},
-    'pro':      {'analyses': 30, 'tier': 'pro'},
+    'старт':    {'analyses': 10, 'tier': 'start'},
+    'start':    {'analyses': 10, 'tier': 'start'},
+    'базовый':  {'analyses': 23, 'tier': 'basic'},
+    'basic':    {'analyses': 23, 'tier': 'basic'},
+    'про':      {'analyses': 40, 'tier': 'pro'},
+    'pro':      {'analyses': 40, 'tier': 'pro'},
 }
 
 def match_tier(variant_name):
