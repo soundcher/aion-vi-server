@@ -8,3 +8,4 @@ geopy
 weasyprint
 gunicorn
 firebase-admin
+pywebpush

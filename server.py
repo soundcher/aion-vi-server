@@ -99,6 +99,101 @@ def decrement_analysis(email):
 app = Flask(__name__)
 CORS(app)
 
+# ── Push-уведомления (Web Push / VAPID) ──
+try:
+    from pywebpush import webpush, WebPushException
+    _webpush_available = True
+except ImportError:
+    _webpush_available = False
+
+VAPID_PRIVATE_KEY = os.environ.get('VAPID_PRIVATE_KEY', '')
+VAPID_PUBLIC_KEY = os.environ.get('VAPID_PUBLIC_KEY', '')
+VAPID_CLAIMS_EMAIL = os.environ.get('VAPID_CLAIMS_EMAIL', 'mailto:aionvi_kod@gmail.com')
+CRON_SECRET = os.environ.get('CRON_SECRET', '')
+
+
+def send_push_to_user(email, title, body, url='/'):
+    """
+    Отправляет push-уведомление одному пользователю по всем его сохранённым
+    подпискам (человек мог разрешить уведомления на нескольких устройствах).
+    Если подписка "протухла" (человек отписался/удалил приложение) — тихо
+    удаляем её из Firebase, чтобы не копить мусор.
+    """
+    if not _webpush_available or not VAPID_PRIVATE_KEY:
+        return {'sent': 0, 'reason': 'webpush_not_configured'}
+
+    key = email_to_key(email)
+    subs_ref = fb_db.reference(f'push_subscriptions/{key}')
+    subs = subs_ref.get() or {}
+
+    sent = 0
+    for sub_id, sub_info in subs.items():
+        try:
+            webpush(
+                subscription_info=sub_info,
+                data=_json.dumps({'title': title, 'body': body, 'url': url}),
+                vapid_private_key=VAPID_PRIVATE_KEY,
+                vapid_claims={'sub': VAPID_CLAIMS_EMAIL}
+            )
+            sent += 1
+        except WebPushException as ex:
+            # 404/410 — подписка больше не действительна, удаляем
+            if '404' in str(ex) or '410' in str(ex):
+                subs_ref.child(sub_id).delete()
+        except Exception:
+            pass
+
+    return {'sent': sent, 'total': len(subs)}
+
+
+@app.route('/push/vapid-public-key', methods=['GET'])
+def push_vapid_public_key():
+    return jsonify({'publicKey': VAPID_PUBLIC_KEY})
+
+
+@app.route('/push/subscribe', methods=['POST'])
+def push_subscribe():
+    data = request.get_json(force=True) or {}
+    email = data.get('email', '').strip().lower()
+    subscription = data.get('subscription')
+    if not email or not subscription:
+        return jsonify({'status': 'error', 'message': 'email и subscription обязательны'}), 400
+
+    key = email_to_key(email)
+    # endpoint используем как уникальный идентификатор подписки конкретного устройства
+    sub_id = hashlib.sha256(subscription.get('endpoint', '').encode()).hexdigest()[:24]
+    fb_db.reference(f'push_subscriptions/{key}/{sub_id}').set(subscription)
+    return jsonify({'status': 'ok'})
+
+
+@app.route('/push/unsubscribe', methods=['POST'])
+def push_unsubscribe():
+    data = request.get_json(force=True) or {}
+    email = data.get('email', '').strip().lower()
+    endpoint = data.get('endpoint', '')
+    if not email or not endpoint:
+        return jsonify({'status': 'error', 'message': 'email и endpoint обязательны'}), 400
+
+    key = email_to_key(email)
+    sub_id = hashlib.sha256(endpoint.encode()).hexdigest()[:24]
+    fb_db.reference(f'push_subscriptions/{key}/{sub_id}').delete()
+    return jsonify({'status': 'ok'})
+
+
+@app.route('/cron/daily-push-check', methods=['POST'])
+def cron_daily_push_check():
+    """
+    Точка входа для Railway Cron — дёргается по расписанию (например, раз в
+    день). Защищена секретом, чтобы её не мог вызвать кто попало. Сюда позже
+    ляжет логика "Вопрос дня" и другие регулярные напоминания.
+    """
+    secret = request.headers.get('X-Cron-Secret', '')
+    if not CRON_SECRET or secret != CRON_SECRET:
+        return jsonify({'status': 'error', 'message': 'forbidden'}), 403
+
+    # TODO: здесь появится реальная логика "Вопрос дня", когда будет готова
+    return jsonify({'status': 'ok', 'checked': True})
+
 # ─────────────────────────────────────────────
 # КОНСТАНТЫ
 # ─────────────────────────────────────────────
@@ -2121,6 +2216,17 @@ def monthly_digest():
             'request': 'Огляд місяця',
             'analysis': analysis_text,
         })
+
+        # Событийный push — не ждём, пока человек сам зайдёт в приложение
+        try:
+            send_push_to_user(
+                email,
+                'AION Vi',
+                'Твой обзор месяца готов ✦',
+                '/calculator.html'
+            )
+        except Exception:
+            pass
 
         return jsonify({
             "status": "ok",
