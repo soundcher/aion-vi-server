@@ -220,6 +220,13 @@ NUDGE_MESSAGES_UK = [
     "Гарний день, щоб поставити собі одне чесне запитання — і отримати на нього чесну відповідь.",
     "Якщо сьогодні все валиться з рук — це не вирок, а просто такий день. Буває.",
     "Легка думка на сьогодні: не все, що відкладається, втрачається.",
+    "Стільки хочу тобі розповісти, а ти не питаєш",
+    "З'явилась новина про тебе",
+    "Поспілкуємося?",
+    "Коли ти мене ні про що не питаєш, я нервуюся",
+    "{nickname}! Агов! Сьогодні зайдеш?",
+    "{nickname}, мені нема з ким поговорити.",
+    "{nickname}, заходь, я завжди маю час для тебе",
 ]
 
 
@@ -274,7 +281,12 @@ def cron_daily_push_check():
 
         lang = (user.get('lang') or 'ru').lower()
         pool = NUDGE_MESSAGES_UK if lang == 'uk' else NUDGE_MESSAGES_RU
-        message = random.choice(pool)
+        nickname = (user.get('nickname') or '').strip()
+
+        # Без реального никнейма фразы вида "{nickname}, заходь" исключаем
+        # из выбора — иначе получится криво. С никнеймом доступны все.
+        candidates = pool if nickname else [m for m in pool if '{nickname}' not in m]
+        message = random.choice(candidates).replace('{nickname}', nickname)
 
         result = send_push_to_user(email, 'AION Vi', message, '/calculator.html')
         if result.get('sent', 0) > 0:
