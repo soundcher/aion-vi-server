@@ -151,6 +151,25 @@ def push_vapid_public_key():
     return jsonify({'publicKey': VAPID_PUBLIC_KEY})
 
 
+@app.route('/user/heartbeat', methods=['POST'])
+def user_heartbeat():
+    """
+    Вызывается один раз при заходе в приложение — фиксирует, что человек
+    реально здесь был. Нужно для логики push "по неактивности": без этого
+    сервер никак не узнает, кого давно не было видно.
+    """
+    data = request.get_json(force=True) or {}
+    email = data.get('email', '').strip().lower()
+    if not email or not firebase_db_available:
+        return jsonify({'status': 'ok'})  # не мешаем загрузке приложения, даже если не удалось
+    try:
+        key = email_to_key(email)
+        fb_db.reference(f'users/{key}/lastActive').set(datetime.utcnow().isoformat())
+    except Exception:
+        pass
+    return jsonify({'status': 'ok'})
+
+
 @app.route('/push/subscribe', methods=['POST'])
 def push_subscribe():
     data = request.get_json(force=True) or {}
@@ -180,19 +199,89 @@ def push_unsubscribe():
     return jsonify({'status': 'ok'})
 
 
+INACTIVITY_DAYS = 3          # через сколько дней молчания считаем человека "пропавшим"
+RENOTIFY_COOLDOWN_DAYS = 3   # не дёргать повторно каждый день подряд, если он всё ещё не зашёл
+
+# Пул сообщений для push по неактивности — чередуются случайно, чтобы не
+# приедалось. Короткие, тёплые, без канцелярита и без "мы соскучились" —
+# в духе друга, а не рассылки.
+NUDGE_MESSAGES_RU = [
+    "Иногда самое важное — просто на секунду остановиться и спросить себя: а что сейчас на самом деле важно?",
+    "Маленький факт на сегодня: большинство решений, которые кажутся срочными, могут подождать до завтра. Но не все.",
+    "Заглянул проверить — как ты там? Всё в порядке?",
+    "Хороший день, чтобы задать себе один честный вопрос — и получить на него честный ответ.",
+    "Если сегодня всё валится из рук — это не приговор, а просто такой день. Бывает.",
+    "Лёгкая мысль на сегодня: не всё, что откладывается, теряется.",
+]
+NUDGE_MESSAGES_UK = [
+    "Іноді найважливіше — просто на секунду зупинитись і спитати себе: а що зараз насправді важливо?",
+    "Маленький факт на сьогодні: більшість рішень, які здаються терміновими, можуть почекати до завтра. Але не всі.",
+    "Зазирнув перевірити — як ти там? Все гаразд?",
+    "Гарний день, щоб поставити собі одне чесне запитання — і отримати на нього чесну відповідь.",
+    "Якщо сьогодні все валиться з рук — це не вирок, а просто такий день. Буває.",
+    "Легка думка на сьогодні: не все, що відкладається, втрачається.",
+]
+
+
 @app.route('/cron/daily-push-check', methods=['POST'])
 def cron_daily_push_check():
     """
-    Точка входа для Railway Cron — дёргается по расписанию (например, раз в
-    день). Защищена секретом, чтобы её не мог вызвать кто попало. Сюда позже
-    ляжет логика "Вопрос дня" и другие регулярные напоминания.
+    Точка входа для Railway Cron — дёргается раз в день по расписанию.
+    Защищена секретом. Логика "по неактивности": не трогаем тех, кто и так
+    заходит сам, напоминаем только тем, кого не было видно INACTIVITY_DAYS
+    дней и дольше, и не чаще раза в RENOTIFY_COOLDOWN_DAYS дней (чтобы не
+    заваливать одного и того же человека каждый день подряд).
     """
     secret = request.headers.get('X-Cron-Secret', '')
     if not CRON_SECRET or secret != CRON_SECRET:
         return jsonify({'status': 'error', 'message': 'forbidden'}), 403
 
-    # TODO: здесь появится реальная логика "Вопрос дня", когда будет готова
-    return jsonify({'status': 'ok', 'checked': True})
+    if not firebase_db_available:
+        return jsonify({'status': 'error', 'message': 'firebase_unavailable'}), 503
+
+    now = datetime.utcnow()
+    users = fb_db.reference('users').get() or {}
+    notified = []
+    skipped = 0
+
+    for key, user in users.items():
+        if not isinstance(user, dict):
+            continue
+        email = user.get('email')
+        last_active_raw = user.get('lastActive')
+        if not email or not last_active_raw:
+            continue  # никогда не заходил после того, как heartbeat заработал — пока не трогаем
+
+        try:
+            last_active = datetime.fromisoformat(last_active_raw)
+        except Exception:
+            continue
+
+        days_inactive = (now - last_active).days
+        if days_inactive < INACTIVITY_DAYS:
+            skipped += 1
+            continue
+
+        last_notified_raw = user.get('lastNudgedAt')
+        if last_notified_raw:
+            try:
+                last_notified = datetime.fromisoformat(last_notified_raw)
+                if (now - last_notified).days < RENOTIFY_COOLDOWN_DAYS:
+                    skipped += 1
+                    continue
+            except Exception:
+                pass
+
+        lang = (user.get('lang') or 'ru').lower()
+        pool = NUDGE_MESSAGES_UK if lang == 'uk' else NUDGE_MESSAGES_RU
+        message = random.choice(pool)
+
+        result = send_push_to_user(email, 'AION Vi', message, '/calculator.html')
+        if result.get('sent', 0) > 0:
+            fb_db.reference(f'users/{key}/lastNudgedAt').set(now.isoformat())
+            notified.append(email)
+
+    return jsonify({'status': 'ok', 'notified': len(notified), 'skipped': skipped})
 
 # ─────────────────────────────────────────────
 # КОНСТАНТЫ
