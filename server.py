@@ -97,7 +97,13 @@ def decrement_analysis(email):
         print(f"⚠️ Не удалось списать анализ: {e}")
 
 app = Flask(__name__)
-CORS(app)
+# CORS ограничен доменами приложения — чужие сайты не могут дёргать наш сервер.
+# Railway-домен оставлен на случай прямых проверок здоровья/отладки.
+CORS(app, origins=[
+    "https://aion-vi.web.app",
+    "https://aion-vi.firebaseapp.com",
+    "https://aion-vi-server-production.up.railway.app",
+])
 
 # ── Push-уведомления (Web Push / VAPID) ──
 try:
@@ -1540,6 +1546,84 @@ def redeem():
         return jsonify({"valid": False, "reason": "error"}), 500
 
 
+REFERRAL_BONUS = 5  # сколько анализов получает каждый (и пригласивший, и приглашённый)
+
+
+@app.route('/referral', methods=['POST'])
+def referral():
+    """
+    Начисляет реферальный бонус: +REFERRAL_BONUS анализов и пригласившему,
+    и новому пользователю. Защита от накрутки:
+    - бонус за конкретного приглашённого начисляется только один раз
+      (запись в referrals_done/{новый_ключ})
+    - нельзя пригласить самого себя
+    - пригласивший должен реально существовать в базе
+    Метка ref — это promo или nickname пригласившего (как формируется на фронте).
+    """
+    data = request.json or {}
+    ref_tag = (data.get('ref') or '').strip()
+    new_email = (data.get('email') or '').strip().lower()
+
+    if not ref_tag or not new_email or not firebase_db_available:
+        return jsonify({"status": "skipped"})
+
+    try:
+        new_key = email_to_key(new_email)
+
+        # Бонус за этого приглашённого уже выдавался? — выходим
+        done_ref = fb_db.reference(f'referrals_done/{new_key}')
+        already = {"done": False}
+        def check_txn(current):
+            if current:
+                already["done"] = True
+                return current
+            return True
+        done_ref.transaction(check_txn)
+        if already["done"]:
+            return jsonify({"status": "already_done"})
+
+        # Находим пригласившего по метке (promo или nickname)
+        users = fb_db.reference('users').get() or {}
+        inviter_key = None
+        for uk, u in users.items():
+            if not isinstance(u, dict):
+                continue
+            if u.get('promo') == ref_tag or u.get('nickname') == ref_tag:
+                inviter_key = uk
+                break
+
+        # Себя пригласить нельзя
+        if inviter_key == new_key:
+            return jsonify({"status": "self_referral"})
+
+        # Начисляем новому пользователю
+        fb_db.reference(f'users/{new_key}/analysesLeft').transaction(
+            lambda c: (c or 0) + REFERRAL_BONUS
+        )
+        fb_db.reference(f'users/{new_key}/analysesTotal').transaction(
+            lambda c: (c or 0) + REFERRAL_BONUS
+        )
+
+        # Начисляем пригласившему, если нашёлся
+        bonus_to_inviter = False
+        if inviter_key:
+            fb_db.reference(f'users/{inviter_key}/analysesLeft').transaction(
+                lambda c: (c or 0) + REFERRAL_BONUS
+            )
+            fb_db.reference(f'users/{inviter_key}/analysesTotal').transaction(
+                lambda c: (c or 0) + REFERRAL_BONUS
+            )
+            bonus_to_inviter = True
+
+        return jsonify({
+            "status": "ok",
+            "bonus": REFERRAL_BONUS,
+            "inviter_rewarded": bonus_to_inviter
+        })
+    except Exception as e:
+        return jsonify({"status": "error"}), 500
+
+
 @app.route('/generate-pdf', methods=['POST'])
 def generate_pdf():
     """Генерирует PDF файл с анализом через WeasyPrint"""
@@ -1926,6 +2010,7 @@ def quick_profile():
 def generate_analysis():
     data = request.json
     try:
+        email = data.get('email', '')
         summary = data.get('summary', '')
         client_request = data.get('request', '')
         lang_instruction = data.get('lang_instruction', 'Отвечай на русском языке.')
@@ -1989,7 +2074,6 @@ def generate_analysis():
         # ── Касса на сервере: обязательна, без email или без связи с базой — отказ ──
         # (раньше отсутствие email просто пропускало проверку — дыра, через
         # которую можно было генерировать бесплатно за наш счёт)
-        email = data.get('email', '')
         if not email:
             return jsonify({"status": "error", "message": "Не удалось определить пользователя. Перезайди в аккаунт."}), 403
         if not firebase_db_available:
