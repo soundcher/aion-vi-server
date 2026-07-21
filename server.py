@@ -1615,6 +1615,22 @@ def referral():
             )
             bonus_to_inviter = True
 
+            # Уведомляем пригласившего push-ом — раньше начисление было
+            # полностью невидимым, человек не понимал, что бонус вообще пришёл
+            try:
+                inviter_data = users.get(inviter_key, {}) or {}
+                inviter_email = inviter_data.get('email', '')
+                inviter_lang = (inviter_data.get('lang') or 'ru').lower()
+                nudge_texts = {
+                    'ru': f'✦ Твой друг зарегистрировался по твоей ссылке — вы оба получили +{REFERRAL_BONUS} анализов!',
+                    'uk': f'✦ Твій друг зареєструвався за твоїм посиланням — ви обоє отримали +{REFERRAL_BONUS} аналізів!',
+                }
+                nudge_text = nudge_texts.get(inviter_lang, nudge_texts['ru'])
+                if inviter_email:
+                    send_push_to_user(inviter_email, 'AION Vi', nudge_text, '/calculator.html')
+            except Exception:
+                pass
+
         return jsonify({
             "status": "ok",
             "bonus": REFERRAL_BONUS,
