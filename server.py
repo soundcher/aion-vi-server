@@ -56,7 +56,7 @@ import json as _json
 firebase_db_available = False
 try:
     import firebase_admin
-    from firebase_admin import credentials, db as fb_db
+    from firebase_admin import credentials, db as fb_db, auth as fb_auth
 
     _key_b64 = os.environ.get('FIREBASE_KEY_B64', '')
     if _key_b64:
@@ -188,7 +188,315 @@ CORS(app, origins=[
     "https://aion-vi.web.app",
     "https://aion-vi.firebaseapp.com",
     "https://aion-vi-server-production.up.railway.app",
-])
+], allow_headers=["Content-Type", "Authorization"])
+
+# ═══════════════════════════════════════════════════════════════
+# ВХОД И ЛИЧНОСТЬ ПОЛЬЗОВАТЕЛЯ
+# ═══════════════════════════════════════════════════════════════
+# Раньше личностью человека была строка email, которую он сам вписывал в
+# форму. Её нельзя было ни доказать, ни восстановить: достаточно знать
+# чужой email — и ты в чужом аккаунте. А если запись в базе не создалась,
+# человек оставался заперт снаружи навсегда.
+#
+# Теперь приложение присылает "пропуск" (ID-токен Firebase) в заголовке
+# Authorization. Пропуск подписан Firebase, подделать его невозможно, и
+# email сервер берёт ИЗ НЕГО, а не из тела запроса.
+#
+# REQUIRE_AUTH — рубильник перехода. Пока выключен, сервер понимает и новый
+# способ, и старый — чтобы работающее приложение не сломалось в момент
+# выкладки. Включаем строгий режим только после того, как новый вход
+# поедет на всех.
+
+REQUIRE_AUTH = os.environ.get('REQUIRE_AUTH', '0') == '1'
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
+
+# Сколько анализов начисляет СЕРВЕР. Браузер эти числа больше не решает.
+FREE_ANALYSES_ON_SIGNUP = 2   # обычная регистрация, без промокода
+ANALYSES_PER_PROMO = 5        # регистрация с действующим промокодом
+
+
+def verified_email_from_request():
+    """
+    Достаёт email из пропуска. Возвращает email или None.
+    Пропуск подписан Firebase, поэтому этому email можно доверять —
+    в отличие от email, присланного в теле запроса.
+    """
+    if not firebase_db_available:
+        return None
+    header = request.headers.get('Authorization', '')
+    if not header.startswith('Bearer '):
+        return None
+    token = header[7:].strip()
+    if not token:
+        return None
+    try:
+        decoded = fb_auth.verify_id_token(token)
+    except Exception:
+        return None
+    # 'email' — у входа через Google и через почту с паролем.
+    # 'aion_email' — у входа через Telegram: Telegram почту не сообщает,
+    # поэтому её вписываем в пропуск мы сами, на сервере.
+    email = decoded.get('email') or decoded.get('aion_email') or ''
+    return email.strip().lower() or None
+
+
+def resolve_email(data):
+    """
+    Определяет, от чьего имени пришёл запрос.
+    Возвращает (email, None) либо (None, готовый ответ с ошибкой).
+    """
+    email = verified_email_from_request()
+    if email:
+        return email, None
+    if REQUIRE_AUTH:
+        return None, (jsonify({
+            "status": "error", "message": "Нужно войти заново."
+        }), 401)
+    fallback = (data.get('email') or '').strip().lower()
+    if not fallback:
+        return None, (jsonify({
+            "status": "error",
+            "message": "Не удалось определить пользователя. Перезайди в аккаунт."
+        }), 403)
+    return fallback, None
+
+
+def build_profile(key):
+    """Сводка по пользователю для приложения. Баланс отдаёт сервер, не браузер."""
+    u = fb_db.reference(f'users/{key}').get() or {}
+    return {
+        'email': u.get('email', ''),
+        'nickname': u.get('nickname', ''),
+        'analysesLeft': u.get('analysesLeft', 0),
+        'analysesTotal': u.get('analysesTotal', 0),
+        'unlimited': bool(u.get('unlimited')),
+        'subscriptionTier': u.get('subscriptionTier', ''),
+        'subscriptionStatus': u.get('subscriptionStatus', ''),
+        'lang': u.get('lang', 'ru'),
+    }
+
+
+def try_use_promo(code, email):
+    """
+    Помечает промокод использованным — атомарно, только если он ещё свободен.
+    Дополнительно запоминаем, кому он достался: раньше этого не было, и
+    понять, чей код сгорел, было невозможно.
+    """
+    if not code or code not in VALID_CODES:
+        return False
+    ref = fb_db.reference(f'used_codes/{code}')
+    result = {"already_used": False}
+
+    def txn(current):
+        if current:
+            result["already_used"] = True
+            return current
+        return True
+
+    ref.transaction(txn)
+    if result["already_used"]:
+        return False
+    try:
+        fb_db.reference(f'used_codes_meta/{code}').set({
+            'email': email,
+            'usedAt': datetime.now().isoformat(),
+        })
+    except Exception:
+        pass
+    return True
+
+
+def verify_telegram_payload(payload):
+    """
+    Проверяет, что данные пришли действительно от Telegram, а не подделаны.
+    Telegram подписывает их ключом, выведенным из токена нашего бота —
+    не зная токена, подпись подделать невозможно.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        return False, "telegram_not_configured"
+    if not isinstance(payload, dict) or 'hash' not in payload:
+        return False, "bad_payload"
+
+    received_hash = str(payload.get('hash', ''))
+    pairs = [f"{k}={payload[k]}" for k in sorted(payload)
+             if k != 'hash' and payload[k] is not None]
+    data_check_string = "\n".join(pairs)
+
+    secret_key = hashlib.sha256(TELEGRAM_BOT_TOKEN.encode()).digest()
+    expected = hmac.new(secret_key, data_check_string.encode(),
+                        hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(expected, received_hash):
+        return False, "bad_signature"
+
+    # Подпись вечная — без этой проверки один раз перехваченные данные
+    # работали бы как ключ бесконечно. Сутки более чем достаточно.
+    try:
+        auth_date = int(payload.get('auth_date', 0))
+    except (TypeError, ValueError):
+        return False, "bad_auth_date"
+    if datetime.utcnow().timestamp() - auth_date > 86400:
+        return False, "expired"
+    return True, None
+
+
+@app.route('/auth/session', methods=['POST'])
+def auth_session():
+    """Кто я и сколько у меня анализов. Единственный источник правды о балансе."""
+    if not rate_limit_ok('auth_session', 60):
+        return too_many_requests()
+    if not firebase_db_available:
+        return jsonify({"status": "error", "message": "Сервис временно недоступен."}), 503
+
+    email = verified_email_from_request()
+    if not email:
+        return jsonify({"status": "error", "message": "Нужно войти заново."}), 401
+
+    key = email_to_key(email)
+    if not fb_db.reference(f'users/{key}').get():
+        return jsonify({"status": "not_registered"})
+
+    try:
+        fb_db.reference(f'users/{key}/lastActive').set(datetime.utcnow().isoformat())
+    except Exception:
+        pass
+    return jsonify({"status": "ok", "profile": build_profile(key)})
+
+
+@app.route('/auth/register', methods=['POST'])
+def auth_register():
+    """
+    Создаёт запись пользователя. Сколько дать анализов, решает СЕРВЕР —
+    браузер это число больше не присылает и подкрутить его не может.
+    Если запись уже есть — ничего не обнуляем: человек просто возвращается.
+    """
+    if not rate_limit_ok('auth_register', 10):
+        return too_many_requests()
+    if not firebase_db_available:
+        return jsonify({"status": "error", "message": "Сервис временно недоступен."}), 503
+
+    email = verified_email_from_request()
+    if not email:
+        return jsonify({"status": "error", "message": "Нужно войти заново."}), 401
+
+    data = request.get_json(force=True) or {}
+    nickname = (data.get('nickname') or '').strip()[:60]
+    lang = (data.get('lang') or 'ru').strip().lower()[:5]
+    promo = (data.get('promo') or '').strip().upper()
+    login_method = (data.get('loginMethod') or '').strip()[:20]
+
+    key = email_to_key(email)
+    ref = fb_db.reference(f'users/{key}')
+    existing = ref.get()
+
+    if existing:
+        # Возвращается тот, кто уже есть. Баланс НЕ трогаем — именно на этом
+        # раньше терялись люди: запись перезаписывалась заново.
+        updates = {'email': email}
+        if nickname and not existing.get('nickname'):
+            updates['nickname'] = nickname
+        if lang:
+            updates['lang'] = lang
+        if login_method:
+            updates['loginMethod'] = login_method
+        try:
+            ref.update(updates)
+        except Exception:
+            pass
+        return jsonify({
+            "status": "ok", "created": False,
+            "promoApplied": False,
+            "profile": build_profile(key)
+        })
+
+    granted = FREE_ANALYSES_ON_SIGNUP
+    promo_applied = False
+    if promo and try_use_promo(promo, email):
+        granted = ANALYSES_PER_PROMO
+        promo_applied = True
+
+    ref.set({
+        'email': email,
+        'nickname': nickname,
+        'promo': promo if promo_applied else 'signup',
+        'analysesLeft': granted,
+        'analysesTotal': granted,
+        'registeredAt': datetime.now().isoformat(),
+        'lang': lang,
+        'loginMethod': login_method,
+    })
+    return jsonify({
+        "status": "ok", "created": True,
+        "promoApplied": promo_applied,
+        "promoRejected": bool(promo) and not promo_applied,
+        "profile": build_profile(key)
+    })
+
+
+@app.route('/auth/telegram', methods=['POST'])
+def auth_telegram():
+    """
+    Вход через Telegram. Telegram почту не сообщает, поэтому:
+    — если этот Telegram уже привязан к аккаунту, входим сразу;
+    — если нет, просим почту один раз и привязываем.
+    Отдаём "разовый ключ", которым приложение получает у Firebase
+    обычный пропуск — дальше Telegram ничем не отличается от Google.
+    """
+    if not rate_limit_ok('auth_telegram', 15):
+        return too_many_requests()
+    if not firebase_db_available:
+        return jsonify({"status": "error", "message": "Сервис временно недоступен."}), 503
+
+    data = request.get_json(force=True) or {}
+    payload = data.get('telegram') or {}
+    ok, reason = verify_telegram_payload(payload)
+    if not ok:
+        return jsonify({
+            "status": "error",
+            "message": "Не удалось подтвердить вход через Telegram. Попробуй ещё раз."
+        }), 401
+
+    tg_id = str(payload.get('id', '')).strip()
+    if not tg_id:
+        return jsonify({"status": "error", "message": "Не удалось подтвердить вход через Telegram."}), 401
+
+    link_ref = fb_db.reference(f'telegram_ids/{tg_id}')
+    linked_key = link_ref.get()
+    email = (data.get('email') or '').strip().lower()
+
+    if not linked_key:
+        if not email or '@' not in email:
+            return jsonify({"status": "need_email"})
+        candidate_key = email_to_key(email)
+        # ВАЖНО: чужую почту так присвоить нельзя. Иначе любой человек с
+        # Telegram назвал бы чужой email и получил бы чужой аккаунт целиком.
+        if fb_db.reference(f'users/{candidate_key}').get():
+            return jsonify({
+                "status": "email_taken",
+                "message": "Этот email уже зарегистрирован. Войди привычным способом — Telegram привяжем позже."
+            }), 409
+        link_ref.set(candidate_key)
+        linked_key = candidate_key
+    else:
+        stored = fb_db.reference(f'users/{linked_key}/email').get()
+        email = (stored or '').strip().lower()
+        if not email:
+            return jsonify({"status": "need_email"})
+
+    try:
+        custom_token = fb_auth.create_custom_token(
+            f'tg_{tg_id}', {'aion_email': email}
+        )
+    except Exception as e:
+        print(f"⚠️ Не удалось создать вход через Telegram: {e}")
+        return jsonify({"status": "error", "message": "Не удалось создать вход."}), 500
+
+    return jsonify({
+        "status": "ok",
+        "token": custom_token.decode() if isinstance(custom_token, bytes) else custom_token,
+        "email": email,
+        "nickname": (payload.get('first_name') or '').strip(),
+    })
+
 
 # ── Push-уведомления (Web Push / VAPID) ──
 try:
@@ -1551,9 +1859,11 @@ def get_history():
     if not rate_limit_ok('history', 20):
         return too_many_requests()
     data = request.json or {}
-    email = (data.get('email') or '').strip()
-    if not email:
-        return jsonify({"status": "error", "message": "no_email"}), 400
+    # Раньше сюда достаточно было прислать ЧУЖОЙ email — и сервер отдавал
+    # чужую личную переписку целиком. Теперь email берётся из пропуска.
+    email, auth_err = resolve_email(data)
+    if auth_err:
+        return auth_err
     if not firebase_db_available:
         return jsonify({"status": "error", "message": "service_unavailable"}), 503
     try:
@@ -1656,7 +1966,10 @@ def referral():
 
     data = request.json or {}
     ref_tag = (data.get('ref') or '').strip()
-    new_email = (data.get('email') or '').strip().lower()
+    verified = verified_email_from_request()
+    if REQUIRE_AUTH and not verified:
+        return jsonify({"status": "error", "message": "Нужно войти заново."}), 401
+    new_email = verified or (data.get('email') or '').strip().lower()
 
     if not ref_tag or not new_email or not firebase_db_available:
         return jsonify({"status": "skipped"})
@@ -2130,7 +2443,9 @@ def generate_analysis():
         return too_many_requests()
     data = request.json
     try:
-        email = data.get('email', '')
+        email, auth_err = resolve_email(data)
+        if auth_err:
+            return auth_err
         summary = data.get('summary', '')
         client_request = data.get('request', '')
         lang_instruction = data.get('lang_instruction', 'Отвечай на русском языке.')
@@ -2450,7 +2765,9 @@ def monthly_digest():
     """
     data = request.json
     try:
-        email = data.get('email', '')
+        email, auth_err = resolve_email(data)
+        if auth_err:
+            return auth_err
         if not firebase_db_available or not email:
             return jsonify({"status": "error", "message": "Не настроено хранилище"}), 400
 
