@@ -17,6 +17,8 @@ from datetime import datetime, timedelta
 import requests as http_requests
 import anthropic
 import os
+import threading
+from collections import defaultdict, deque
 
 ANTHROPIC_API_KEY = os.environ.get('ANTHROPIC_API_KEY', '')
 
@@ -97,6 +99,89 @@ def decrement_analysis(email):
         print(f"⚠️ Не удалось списать анализ: {e}")
 
 app = Flask(__name__)
+
+
+# ── Ограничитель частоты запросов ("турникет") ──
+# Защищает от того, чтобы один человек или скрипт долбил наш сервер тысячами
+# запросов: жёг наши деньги на токенах, перебирал промокоды или заваливал
+# бесплатный сервис карт OpenStreetMap (за это банят по IP — и тогда поиск
+# города отвалится сразу у всех наших пользователей).
+#
+# Счётчик живёт в памяти процесса. Railway держит один экземпляр сервера,
+# поэтому этого достаточно. При перезапуске сервера счётчики обнуляются —
+# это нормально и никому не мешает.
+_rate_lock = threading.Lock()
+_rate_hits = defaultdict(deque)
+
+
+def _client_ip():
+    """
+    Настоящий адрес пользователя. Railway пропускает запросы через свой
+    прокси, поэтому напрямую мы увидели бы адрес прокси — один и тот же
+    для ВСЕХ. Тогда турникет заблокировал бы вообще всех разом.
+    Реальный адрес приходит в заголовке X-Forwarded-For.
+    """
+    fwd = request.headers.get('X-Forwarded-For', '')
+    if fwd:
+        return fwd.split(',')[0].strip()
+    return request.remote_addr or 'unknown'
+
+
+def rate_limit_ok(bucket, limit, window_seconds=60):
+    """
+    Возвращает False, если с этого адреса за последнюю минуту уже было
+    больше limit обращений к данному участку. Лимиты намеренно щедрые:
+    мобильные операторы прячут множество людей за одним адресом, и мы
+    не имеем права отсекать живых пользователей.
+    При любой внутренней ошибке пропускаем запрос — турникет никогда
+    не должен становиться причиной поломки приложения.
+    """
+    try:
+        now_ts = datetime.utcnow().timestamp()
+        key = f"{bucket}:{_client_ip()}"
+        with _rate_lock:
+            hits = _rate_hits[key]
+            while hits and now_ts - hits[0] > window_seconds:
+                hits.popleft()
+            if len(hits) >= limit:
+                return False
+            hits.append(now_ts)
+            # Периодическая уборка пустых записей, чтобы память не росла
+            if len(_rate_hits) > 5000:
+                for k in [k for k, v in list(_rate_hits.items()) if not v]:
+                    _rate_hits.pop(k, None)
+        return True
+    except Exception:
+        return True
+
+
+def too_many_requests():
+    return jsonify({
+        "status": "error",
+        "message": "Слишком много запросов подряд. Подожди минуту и попробуй снова."
+    }), 429
+
+
+def read_coords(data):
+    """
+    Достаёт координаты места рождения. Раньше при неудачном поиске города
+    молча подставлялся Киев — человек получал уверенный и полностью неверный
+    разбор, и никто об этом не узнавал. Теперь честно: нет координат —
+    нет расчёта.
+    Возвращает (lat, lon, None) при успехе или (None, None, текст ошибки).
+    """
+    raw_lat = data.get('lat')
+    raw_lon = data.get('lon')
+    try:
+        lat = float(raw_lat)
+        lon = float(raw_lon)
+    except (TypeError, ValueError):
+        return None, None, "Не удалось определить место рождения. Проверь название города и попробуй ещё раз."
+    if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+        return None, None, "Координаты места рождения выглядят некорректно. Уточни город."
+    return lat, lon, None
+
+
 # CORS ограничен доменами приложения — чужие сайты не могут дёргать наш сервер.
 # Railway-домен оставлен на случай прямых проверок здоровья/отладки.
 CORS(app, origins=[
@@ -1463,6 +1548,8 @@ def lemonsqueezy_webhook():
 
 @app.route('/history', methods=['POST'])
 def get_history():
+    if not rate_limit_ok('history', 20):
+        return too_many_requests()
     data = request.json or {}
     email = (data.get('email') or '').strip()
     if not email:
@@ -1490,6 +1577,8 @@ def get_history():
 
 @app.route('/rate', methods=['POST'])
 def rate():
+    if not rate_limit_ok('rate', 10):
+        return too_many_requests()
     data = request.json or {}
     rating = data.get('rating')
     comment = (data.get('comment') or '').strip()[:2000]  # ограничение на длину
@@ -1519,6 +1608,8 @@ def rate():
 
 @app.route('/redeem', methods=['POST'])
 def redeem():
+    if not rate_limit_ok('redeem', 5):
+        return jsonify({"valid": False, "reason": "too_many"}), 429
     data = request.json or {}
     code = (data.get('code') or '').strip().upper()
 
@@ -1560,6 +1651,9 @@ def referral():
     - пригласивший должен реально существовать в базе
     Метка ref — это promo или nickname пригласившего (как формируется на фронте).
     """
+    if not rate_limit_ok('referral', 10):
+        return jsonify({"status": "error", "message": "too_many"}), 429
+
     data = request.json or {}
     ref_tag = (data.get('ref') or '').strip()
     new_email = (data.get('email') or '').strip().lower()
@@ -1784,6 +1878,8 @@ def generate_pdf():
 
 @app.route('/geocode', methods=['POST'])
 def geocode_endpoint():
+    if not rate_limit_ok('geocode', 30):
+        return too_many_requests()
     data = request.json
     place = data.get('place', '')
     lat, lon, display = geocode(place)
@@ -1793,14 +1889,17 @@ def geocode_endpoint():
 
 @app.route('/calculate', methods=['POST'])
 def calculate():
+    if not rate_limit_ok('calculate', 20):
+        return too_many_requests()
     data = request.json
     try:
         try:
             day, month, year, hour, minute = validate_birth_data(data)
         except ValueError as ve:
             return jsonify({"status": "error", "message": str(ve)}), 400
-        lat = float(data.get('lat', 50.45))
-        lon = float(data.get('lon', 30.52))
+        lat, lon, coord_err = read_coords(data)
+        if coord_err:
+            return jsonify({"status": "error", "message": coord_err}), 400
         firstname = data.get('firstname', '')
         lastname = data.get('lastname', '')
 
@@ -1829,14 +1928,17 @@ def calculate():
 
 @app.route('/summary', methods=['POST'])
 def summary():
+    if not rate_limit_ok('summary', 20):
+        return too_many_requests()
     data = request.json
     try:
         try:
             day, month, year, hour, minute = validate_birth_data(data)
         except ValueError as ve:
             return jsonify({"status": "error", "message": str(ve)}), 400
-        lat = float(data.get('lat', 50.45))
-        lon = float(data.get('lon', 30.52))
+        lat, lon, coord_err = read_coords(data)
+        if coord_err:
+            return jsonify({"status": "error", "message": coord_err}), 400
         firstname = data.get('firstname', '')
         lastname = data.get('lastname', '')
         gender = data.get('gender', '')
@@ -2024,6 +2126,8 @@ def quick_profile():
 
 @app.route('/generate', methods=['POST'])
 def generate_analysis():
+    if not rate_limit_ok('generate', 20):
+        return too_many_requests()
     data = request.json
     try:
         email = data.get('email', '')
@@ -2332,6 +2436,8 @@ def generate_analysis():
 
 @app.route('/monthly-digest', methods=['POST'])
 def monthly_digest():
+    if not rate_limit_ok('monthly_digest', 10):
+        return too_many_requests()
     """
     'Обзор месяца' — ленивая генерация раз в календарный месяц на человека.
     Фронтенд дёргает этот эндпоинт при заходе в приложение.
@@ -2364,18 +2470,20 @@ def monthly_digest():
                 "month": month_key
             })
 
-        year = data.get('year')
-        month = data.get('month')
-        day = data.get('day')
-        hour = data.get('hour', 12)
-        minute = data.get('minute', 0)
-        lat = data.get('lat')
-        lon = data.get('lon')
-        lang_instruction = data.get('lang_instruction', 'Отвечай на русском языке.')
+        # ВАЖНО: раньше здесь было `err = validate_birth_data(data)` — но эта
+        # функция возвращает готовые числа, а не текст ошибки. Любой непустой
+        # ответ считался ошибкой, поэтому "Обзор месяца" отваливался ВСЕГДА,
+        # при полностью корректных данных. Теперь как в остальных местах.
+        try:
+            day, month, year, hour, minute = validate_birth_data(data)
+        except ValueError as ve:
+            return jsonify({"status": "error", "message": str(ve)}), 400
 
-        err = validate_birth_data(data)
-        if err:
-            return jsonify({"status": "error", "message": err}), 400
+        lat, lon, coord_err = read_coords(data)
+        if coord_err:
+            return jsonify({"status": "error", "message": coord_err}), 400
+
+        lang_instruction = data.get('lang_instruction', 'Отвечай на русском языке.')
 
         nat = calc_natal(year, month, day, hour, minute, lat, lon)
         age = now.year - year - ((now.month, now.day) < (month, day))
