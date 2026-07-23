@@ -215,12 +215,8 @@ FREE_ANALYSES_ON_SIGNUP = 2   # обычная регистрация, без п
 ANALYSES_PER_PROMO = 5        # регистрация с действующим промокодом
 
 
-def verified_email_from_request():
-    """
-    Достаёт email из пропуска. Возвращает email или None.
-    Пропуск подписан Firebase, поэтому этому email можно доверять —
-    в отличие от email, присланного в теле запроса.
-    """
+def decoded_claims_from_request():
+    """Разбирает пропуск целиком. Возвращает словарь или None."""
     if not firebase_db_available:
         return None
     header = request.headers.get('Authorization', '')
@@ -230,8 +226,19 @@ def verified_email_from_request():
     if not token:
         return None
     try:
-        decoded = fb_auth.verify_id_token(token)
+        return fb_auth.verify_id_token(token)
     except Exception:
+        return None
+
+
+def verified_email_from_request():
+    """
+    Достаёт email из пропуска. Возвращает email или None.
+    Пропуск подписан Firebase, поэтому этому email можно доверять —
+    в отличие от email, присланного в теле запроса.
+    """
+    decoded = decoded_claims_from_request()
+    if not decoded:
         return None
     # 'email' — у входа через Google и через почту с паролем.
     # 'aion_email' — у входа через Telegram: Telegram почту не сообщает,
@@ -347,16 +354,19 @@ def auth_session():
     if not firebase_db_available:
         return jsonify({"status": "error", "message": "Сервис временно недоступен."}), 503
 
-    email = verified_email_from_request()
+    decoded = decoded_claims_from_request()
+    email = (decoded.get('email') or decoded.get('aion_email') or '').strip().lower() if decoded else None
     if not email:
         return jsonify({"status": "error", "message": "Нужно войти заново."}), 401
 
     key = email_to_key(email)
-    if not fb_db.reference(f'users/{key}').get():
+    user_ref = fb_db.reference(f'users/{key}')
+    user = user_ref.get()
+    if not user:
         return jsonify({"status": "not_registered"})
 
     try:
-        fb_db.reference(f'users/{key}/lastActive').set(datetime.utcnow().isoformat())
+        user_ref.child('lastActive').set(datetime.utcnow().isoformat())
     except Exception:
         pass
     return jsonify({"status": "ok", "profile": build_profile(key)})
@@ -369,12 +379,13 @@ def auth_register():
     браузер это число больше не присылает и подкрутить его не может.
     Если запись уже есть — ничего не обнуляем: человек просто возвращается.
     """
-    if not rate_limit_ok('auth_register', 10):
+    if not rate_limit_ok('auth_register', 30):
         return too_many_requests()
     if not firebase_db_available:
         return jsonify({"status": "error", "message": "Сервис временно недоступен."}), 503
 
-    email = verified_email_from_request()
+    decoded = decoded_claims_from_request()
+    email = (decoded.get('email') or decoded.get('aion_email') or '').strip().lower() if decoded else None
     if not email:
         return jsonify({"status": "error", "message": "Нужно войти заново."}), 401
 
@@ -383,10 +394,11 @@ def auth_register():
     lang = (data.get('lang') or 'ru').strip().lower()[:5]
     promo = (data.get('promo') or '').strip().upper()
     login_method = (data.get('loginMethod') or '').strip()[:20]
+    ref_tag = (data.get('ref') or '').strip()[:60]
 
     key = email_to_key(email)
-    ref = fb_db.reference(f'users/{key}')
-    existing = ref.get()
+    user_ref = fb_db.reference(f'users/{key}')
+    existing = user_ref.get()
 
     if existing:
         # Возвращается тот, кто уже есть. Баланс НЕ трогаем — именно на этом
@@ -399,7 +411,7 @@ def auth_register():
         if login_method:
             updates['loginMethod'] = login_method
         try:
-            ref.update(updates)
+            user_ref.update(updates)
         except Exception:
             pass
         return jsonify({
@@ -408,22 +420,55 @@ def auth_register():
             "profile": build_profile(key)
         })
 
-    granted = FREE_ANALYSES_ON_SIGNUP
+    # Здесь создаётся НОВЫЙ аккаунт. Живой человек делает это один раз,
+    # поэтому потолок «3 новых аккаунта в час с одного адреса» он не заметит
+    # никогда. А штамповка фиктивных почт упирается в него сразу: менять
+    # адрес каждые три аккаунта ради пары запросов бессмысленно.
+    # Проверка стоит ПОСЛЕ ветки «человек уже есть» — возвращающимся
+    # пользователям она не мешает вообще.
+    if not rate_limit_ok('auth_signup_new', 3, window_seconds=3600):
+        return jsonify({
+            "status": "error",
+            "message": "Слишком много новых аккаунтов с этого устройства. Попробуй позже."
+        }), 429
+
     promo_applied = False
     if promo and try_use_promo(promo, email):
-        granted = ANALYSES_PER_PROMO
         promo_applied = True
 
-    ref.set({
+    # Бесплатные запросы выдаются СРАЗУ. Подтверждение почты здесь было бы
+    # защитой от фиктивных регистраций, но цена вопроса — центы токенов,
+    # а плата за неё — минута жизни каждого честного человека и выход из
+    # приложения в почтовый ящик. На этапе привлечения это невыгодный обмен.
+    # Фиктивные регистрации ограничивает лимит по адресу (см. ниже).
+    base = ANALYSES_PER_PROMO if promo_applied else FREE_ANALYSES_ON_SIGNUP
+
+    record = {
         'email': email,
         'nickname': nickname,
         'promo': promo if promo_applied else 'signup',
-        'analysesLeft': granted,
-        'analysesTotal': granted,
+        'analysesLeft': base,
+        'analysesTotal': base,
         'registeredAt': datetime.now().isoformat(),
         'lang': lang,
         'loginMethod': login_method,
-    })
+        'firstGenerationAt': '',
+    }
+
+    # Приглашение от друга. Бонус +5 обоим начислится не сейчас, а когда
+    # приглашённый сделает свой первый запрос — иначе накрутка сводится
+    # к штамповке пустых регистраций без единого реального обращения.
+    if ref_tag and ref_tag != key:
+        # Метка — это ключ пригласившего напрямую (см. calculator.html).
+        # Прямое обращение по ключу вместо перебора всех пользователей —
+        # быстрее и однозначнее: коллизий нет в принципе.
+        try:
+            if fb_db.reference(f'users/{ref_tag}').get():
+                record['pendingRef'] = ref_tag
+        except Exception:
+            pass
+
+    user_ref.set(record)
     return jsonify({
         "status": "ok", "created": True,
         "promoApplied": promo_applied,
@@ -507,7 +552,7 @@ except ImportError:
 
 VAPID_PRIVATE_KEY = os.environ.get('VAPID_PRIVATE_KEY', '')
 VAPID_PUBLIC_KEY = os.environ.get('VAPID_PUBLIC_KEY', '')
-VAPID_CLAIMS_EMAIL = os.environ.get('VAPID_CLAIMS_EMAIL', 'mailto:aionvi_kod@gmail.com')
+VAPID_CLAIMS_EMAIL = os.environ.get('VAPID_CLAIMS_EMAIL', 'mailto:soundcher11@gmail.com')
 CRON_SECRET = os.environ.get('CRON_SECRET', '')
 
 
@@ -1950,35 +1995,31 @@ def redeem():
 REFERRAL_BONUS = 5  # сколько анализов получает каждый (и пригласивший, и приглашённый)
 
 
-@app.route('/referral', methods=['POST'])
-def referral():
+def resolve_pending_referral(email):
     """
-    Начисляет реферальный бонус: +REFERRAL_BONUS анализов и пригласившему,
-    и новому пользователю. Защита от накрутки:
-    - бонус за конкретного приглашённого начисляется только один раз
-      (запись в referrals_done/{новый_ключ})
-    - нельзя пригласить самого себя
-    - пригласивший должен реально существовать в базе
-    Метка ref — это promo или nickname пригласившего (как формируется на фронте).
+    Начисляет реферальный бонус — но только когда приглашённый сделал свой
+    ПЕРВЫЙ настоящий запрос, не в момент регистрации. Раньше бонус давали
+    сразу при регистрации: это позволяло штамповать пустые аккаунты,
+    ни разу не воспользовавшись сервисом, и накручивать вознаграждение
+    без единого реального обращения — дороже нам, бесполезно для роста.
+
+    Защита от накрутки:
+    - зачисляется не более одного раза на приглашённого
+      (запись в referrals_done/{ключ}, атомарно)
+    - пригласивший должен реально существовать
+    - самого себя пригласить нельзя
+    Никакого потолка на число приглашений НЕТ — это реферальная программа,
+    её смысл в росте, а не в его ограничении.
     """
-    if not rate_limit_ok('referral', 10):
-        return jsonify({"status": "error", "message": "too_many"}), 429
-
-    data = request.json or {}
-    ref_tag = (data.get('ref') or '').strip()
-    verified = verified_email_from_request()
-    if REQUIRE_AUTH and not verified:
-        return jsonify({"status": "error", "message": "Нужно войти заново."}), 401
-    new_email = verified or (data.get('email') or '').strip().lower()
-
-    if not ref_tag or not new_email or not firebase_db_available:
-        return jsonify({"status": "skipped"})
-
     try:
-        new_key = email_to_key(new_email)
+        key = email_to_key(email)
+        user_ref = fb_db.reference(f'users/{key}')
+        user = user_ref.get() or {}
+        inviter_key = user.get('pendingRef')
+        if not inviter_key:
+            return False
 
-        # Бонус за этого приглашённого уже выдавался? — выходим
-        done_ref = fb_db.reference(f'referrals_done/{new_key}')
+        done_ref = fb_db.reference(f'referrals_done/{key}')
         already = {"done": False}
         def check_txn(current):
             if current:
@@ -1987,64 +2028,43 @@ def referral():
             return True
         done_ref.transaction(check_txn)
         if already["done"]:
-            return jsonify({"status": "already_done"})
+            user_ref.update({'pendingRef': None})
+            return False
 
-        # Находим пригласившего по метке (promo или nickname)
-        users = fb_db.reference('users').get() or {}
-        inviter_key = None
-        for uk, u in users.items():
-            if not isinstance(u, dict):
-                continue
-            if u.get('promo') == ref_tag or u.get('nickname') == ref_tag:
-                inviter_key = uk
-                break
+        if inviter_key == key:
+            user_ref.update({'pendingRef': None})
+            return False
 
-        # Себя пригласить нельзя
-        if inviter_key == new_key:
-            return jsonify({"status": "self_referral"})
+        inviter_ref = fb_db.reference(f'users/{inviter_key}')
+        inviter_data = inviter_ref.get()
+        if not inviter_data:
+            user_ref.update({'pendingRef': None})
+            return False
 
-        # Начисляем новому пользователю
-        fb_db.reference(f'users/{new_key}/analysesLeft').transaction(
-            lambda c: (c or 0) + REFERRAL_BONUS
-        )
-        fb_db.reference(f'users/{new_key}/analysesTotal').transaction(
-            lambda c: (c or 0) + REFERRAL_BONUS
-        )
+        user_ref.child('analysesLeft').transaction(lambda c: (c or 0) + REFERRAL_BONUS)
+        user_ref.child('analysesTotal').transaction(lambda c: (c or 0) + REFERRAL_BONUS)
+        inviter_ref.child('analysesLeft').transaction(lambda c: (c or 0) + REFERRAL_BONUS)
+        inviter_ref.child('analysesTotal').transaction(lambda c: (c or 0) + REFERRAL_BONUS)
+        user_ref.update({'pendingRef': None})
 
-        # Начисляем пригласившему, если нашёлся
-        bonus_to_inviter = False
-        if inviter_key:
-            fb_db.reference(f'users/{inviter_key}/analysesLeft').transaction(
-                lambda c: (c or 0) + REFERRAL_BONUS
-            )
-            fb_db.reference(f'users/{inviter_key}/analysesTotal').transaction(
-                lambda c: (c or 0) + REFERRAL_BONUS
-            )
-            bonus_to_inviter = True
-
-            # Уведомляем пригласившего push-ом — раньше начисление было
-            # полностью невидимым, человек не понимал, что бонус вообще пришёл
-            try:
-                inviter_data = users.get(inviter_key, {}) or {}
-                inviter_email = inviter_data.get('email', '')
-                inviter_lang = (inviter_data.get('lang') or 'ru').lower()
-                nudge_texts = {
-                    'ru': f'✦ Твой друг зарегистрировался по твоей ссылке — вы оба получили +{REFERRAL_BONUS} анализов!',
-                    'uk': f'✦ Твій друг зареєструвався за твоїм посиланням — ви обоє отримали +{REFERRAL_BONUS} аналізів!',
-                }
-                nudge_text = nudge_texts.get(inviter_lang, nudge_texts['ru'])
-                if inviter_email:
-                    send_push_to_user(inviter_email, 'AION Vi', nudge_text, '/calculator.html')
-            except Exception:
-                pass
-
-        return jsonify({
-            "status": "ok",
-            "bonus": REFERRAL_BONUS,
-            "inviter_rewarded": bonus_to_inviter
-        })
+        # Уведомляем пригласившего push-ом — раньше начисление было
+        # полностью невидимым, человек не понимал, что бонус вообще пришёл
+        try:
+            inviter_email = inviter_data.get('email', '')
+            inviter_lang = (inviter_data.get('lang') or 'ru').lower()
+            nudge_texts = {
+                'ru': f'✦ Твой друг сделал первый запрос — вы оба получили +{REFERRAL_BONUS} запросов!',
+                'uk': f'✦ Твій друг зробив перший запит — ви обоє отримали +{REFERRAL_BONUS} запитів!',
+            }
+            nudge_text = nudge_texts.get(inviter_lang, nudge_texts['ru'])
+            if inviter_email:
+                send_push_to_user(inviter_email, 'AION Vi', nudge_text, '/calculator.html')
+        except Exception:
+            pass
+        return True
     except Exception as e:
-        return jsonify({"status": "error"}), 500
+        print(f"⚠️ Не удалось зачислить реферальный бонус: {e}")
+        return False
 
 
 @app.route('/generate-pdf', methods=['POST'])
@@ -2057,7 +2077,7 @@ def generate_pdf():
         birthdate = data.get('birthdate', '—')
 
         if not analysis:
-            return jsonify({"status": "error", "message": "Нет текста анализа"}), 400
+            return jsonify({"status": "error", "message": "Нет текста ответа"}), 400
 
         try:
             from weasyprint import HTML, CSS
@@ -2151,7 +2171,7 @@ def generate_pdf():
   <div class="client-date">{birthdate}</div>
 </div>
 <div class="body">{analysis}</div>
-<div class="footer">AION Vi · Персональный анализ создан специально для тебя</div>
+<div class="footer">AION Vi · Персональный ответ создан специально для тебя</div>
 </body>
 </html>"""
 
@@ -2167,7 +2187,7 @@ def generate_pdf():
             # кириллическое имя (RFC 5987) для всех современных браузеров —
             # пользователь увидит файл с нормальным русским/украинским именем.
             raw_filename = f"AION_Vi_{name.replace(' ', '_')}_{birthdate.replace('.', '-')}.pdf"
-            ascii_fallback = "AION_Vi_analysis.pdf"
+            ascii_fallback = "AION_Vi.pdf"
             encoded_filename = quote(raw_filename)
 
             return Response(
@@ -2510,7 +2530,7 @@ def generate_analysis():
                 )
 
         if not summary:
-            return jsonify({"status": "error", "message": "Нет данных для анализа"}), 400
+            return jsonify({"status": "error", "message": "Нет данных для запроса"}), 400
 
         # ── Касса на сервере: обязательна, без email или без связи с базой — отказ ──
         # (раньше отсутствие email просто пропускало проверку — дыра, через
@@ -2530,7 +2550,7 @@ def generate_analysis():
         if not is_unlimited and left is not None and left <= 0:
             return jsonify({
                 "status": "error",
-                "message": "Анализы на этом пакете закончились. Продолжи с новым пакетом."
+                "message": "Запросы на этом пакете закончились. Продолжи с новым пакетом."
             }), 403
 
         api_key = ANTHROPIC_API_KEY
@@ -2714,12 +2734,18 @@ def generate_analysis():
         if detect_crisis(client_request):
             analysis_text += CRISIS_ADDENDUM.get(lang_instruction, CRISIS_ADDENDUM['Отвечай на русском языке.'])
 
-        # Списываем анализ только при успехе, и только если не безлимитный
+        # Списываем запрос только при успехе, и только если не безлимитный
         new_left = None
         if firebase_db_available and email:
             if not is_unlimited:
                 decrement_analysis(email)
             new_left = get_analyses_left(email)
+
+            # Первый РЕАЛЬНЫЙ запрос — не регистрация, а фактическое обращение.
+            # Только теперь, если человека кто-то пригласил, зачисляем +5 обоим.
+            # Раньше бонус давался в момент регистрации — этим можно было
+            # накручивать пустые аккаунты без единого настоящего обращения.
+            referral_bonus_applied = resolve_pending_referral(email)
 
             # ── История: сервер сохраняет сам, клиенту раздел недоступен напрямую ──
             try:
@@ -2739,7 +2765,8 @@ def generate_analysis():
             "status": "ok",
             "analysis": analysis_text,
             "tokens_used": message.usage.input_tokens + message.usage.output_tokens,
-            "analyses_left": new_left
+            "analyses_left": new_left,
+            "referralBonusApplied": referral_bonus_applied if firebase_db_available and email else False
         })
 
     except anthropic.AuthenticationError:
