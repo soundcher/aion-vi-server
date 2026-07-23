@@ -247,14 +247,34 @@ def verified_email_from_request():
     return email.strip().lower() or None
 
 
-def resolve_email(data):
+# Гость — человек, выбравший "попробовать без регистрации". У него нет
+# аккаунта и нет пропуска, поэтому опознать его можно только по адресу
+# устройства. Один бесплатный запрос в 6 часов: живому человеку хватает
+# распробовать, накрутка упирается в потолок сразу.
+GUEST_FREE_WINDOW_SECONDS = 6 * 3600
+
+
+def resolve_email(data, allow_guest=False):
     """
     Определяет, от чьего имени пришёл запрос.
-    Возвращает (email, None) либо (None, готовый ответ с ошибкой).
+    Возвращает (email, None) — обычный пользователь;
+              ('__guest__', None) — гость без аккаунта;
+              (None, готовый ответ с ошибкой).
     """
     email = verified_email_from_request()
     if email:
         return email, None
+
+    # Гостевой путь работает и в строгом режиме: он не трогает ничей баланс
+    # и ничего не читает из чужих данных, поэтому пропуск ему не нужен.
+    if allow_guest and data.get('guest'):
+        if not rate_limit_ok('guest_generate', 1, window_seconds=GUEST_FREE_WINDOW_SECONDS):
+            return None, (jsonify({
+                "status": "error",
+                "message": "Бесплатный запрос уже использован. Зарегистрируйся — это бесплатно и откроет ещё два."
+            }), 429)
+        return '__guest__', None
+
     if REQUIRE_AUTH:
         return None, (jsonify({
             "status": "error", "message": "Нужно войти заново."
@@ -2463,9 +2483,12 @@ def generate_analysis():
         return too_many_requests()
     data = request.json
     try:
-        email, auth_err = resolve_email(data)
+        email, auth_err = resolve_email(data, allow_guest=True)
         if auth_err:
             return auth_err
+        is_guest = (email == '__guest__')
+        if is_guest:
+            email = ''   # у гостя нет ни записи, ни баланса, ни истории
         summary = data.get('summary', '')
         client_request = data.get('request', '')
         lang_instruction = data.get('lang_instruction', 'Отвечай на русском языке.')
@@ -2535,19 +2558,32 @@ def generate_analysis():
         # ── Касса на сервере: обязательна, без email или без связи с базой — отказ ──
         # (раньше отсутствие email просто пропускало проверку — дыра, через
         # которую можно было генерировать бесплатно за наш счёт)
-        if not email:
-            return jsonify({"status": "error", "message": "Не удалось определить пользователя. Перезайди в аккаунт."}), 403
-        if not firebase_db_available:
-            return jsonify({"status": "error", "message": "Сервис временно недоступен, попробуй через минуту."}), 503
-
-        left = get_analyses_left(email)
+        # Гость проходит мимо кассы целиком: у него нет ни записи, ни баланса.
+        # Его единственный бесплатный запрос уже отмерен по адресу устройства
+        # выше, в resolve_email.
         is_unlimited = False
-        try:
-            key = email_to_key(email)
-            is_unlimited = bool(fb_db.reference(f'users/{key}/unlimited').get())
-        except Exception:
-            pass
-        if not is_unlimited and left is not None and left <= 0:
+        if not is_guest:
+            if not email:
+                return jsonify({"status": "error", "message": "Не удалось определить пользователя. Перезайди в аккаунт."}), 403
+            if not firebase_db_available:
+                return jsonify({"status": "error", "message": "Сервис временно недоступен, попробуй через минуту."}), 503
+
+            left = get_analyses_left(email)
+            try:
+                key = email_to_key(email)
+                is_unlimited = bool(fb_db.reference(f'users/{key}/unlimited').get())
+            except Exception:
+                pass
+            # Записи нет вообще — значит человек не проходил регистрацию.
+            # Раньше такой запрос проскакивал бесплатно за наш счёт.
+            if not is_unlimited and left is None:
+                return jsonify({
+                    "status": "error",
+                    "message": "Не удалось определить пользователя. Перезайди в аккаунт."
+                }), 403
+        else:
+            left = None
+        if not is_guest and not is_unlimited and left is not None and left <= 0:
             return jsonify({
                 "status": "error",
                 "message": "Запросы на этом пакете закончились. Продолжи с новым пакетом."
