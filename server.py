@@ -1919,6 +1919,76 @@ def lemonsqueezy_webhook():
     return jsonify({"status": "ok"})
 
 
+CREEM_WEBHOOK_SECRET = os.environ.get('CREEM_WEBHOOK_SECRET', '')
+
+# ── Тарифы — сопоставление ID товара в Creem с пакетом ──
+# ID приходят из Creem: Товары → открыть товар → в деталях.
+CREEM_PRODUCT_TIERS = {
+    'prod_1aKlE6ApBfTPS9zuP6CqXp': {'analyses': 10, 'tier': 'start'},
+    'prod_42xzm8AIpWfT3QWuOpqLj0': {'analyses': 23, 'tier': 'basic'},
+    'prod_1ucuYSXljSqUOJvVQrsWn':  {'analyses': 40, 'tier': 'pro'},
+}
+
+@app.route('/webhooks/creem', methods=['POST'])
+def creem_webhook():
+    raw_body = request.get_data()  # сырое тело — обязательно для проверки подписи
+
+    if not CREEM_WEBHOOK_SECRET:
+        return jsonify({"status": "error", "message": "webhook_secret_not_configured"}), 500
+
+    signature = request.headers.get('creem-signature', '')
+    expected = hmac.new(
+        CREEM_WEBHOOK_SECRET.encode('utf-8'),
+        raw_body,
+        hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        return jsonify({"status": "error", "message": "invalid_signature"}), 401
+
+    try:
+        payload = _json.loads(raw_body)
+    except Exception:
+        return jsonify({"status": "error", "message": "invalid_json"}), 400
+
+    event_type = payload.get('eventType', '')
+    obj = payload.get('object', {}) or {}
+    customer = obj.get('customer', {}) or {}
+    user_email = (customer.get('email') or '').strip().lower()
+    product = obj.get('product', {}) or {}
+    product_id = product.get('id', '')
+
+    if not user_email:
+        return jsonify({"status": "ok", "message": "no_email_skip"})
+
+    # ── Первая оплата или продление подписки — выдаём/обновляем пакет ──
+    # subscription.active намеренно НЕ используем для начисления — по
+    # рекомендации самого Creem, он только для синхронизации статуса.
+    if event_type in ('checkout.completed', 'subscription.paid'):
+        tier_data = CREEM_PRODUCT_TIERS.get(product_id)
+        if tier_data and firebase_db_available:
+            try:
+                key = email_to_key(user_email)
+                fb_db.reference(f'users/{key}').update({
+                    'analysesLeft': tier_data['analyses'],
+                    'analysesTotal': tier_data['analyses'],
+                    'subscriptionTier': tier_data['tier'],
+                    'subscriptionStatus': 'active',
+                })
+            except Exception as e:
+                print(f"⚠️ Ошибка обновления после оплаты (Creem): {e}")
+
+    # ── Подписка отменена/истекла — остаток запросов не отбираем ──
+    elif event_type in ('subscription.canceled', 'subscription.expired'):
+        if firebase_db_available:
+            try:
+                key = email_to_key(user_email)
+                fb_db.reference(f'users/{key}').update({'subscriptionStatus': 'inactive'})
+            except Exception as e:
+                print(f"⚠️ Ошибка обновления при отмене (Creem): {e}")
+
+    return jsonify({"status": "ok"})
+
+
 @app.route('/history', methods=['POST'])
 def get_history():
     if not rate_limit_ok('history', 20):
