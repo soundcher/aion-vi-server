@@ -100,6 +100,15 @@ def decrement_analysis(email):
 
 app = Flask(__name__)
 
+# ── Sentry: раньше поломки у людей проходили незамеченными ──
+# send_default_pii=False намеренно: не шлём в Sentry email/IP пользователей —
+# для отладки хватает текста ошибки и трассировки стека, а личные данные
+# наших людей (беженцы/эмигранты) лишний раз наружу лучше не пускать.
+SENTRY_DSN = os.environ.get('SENTRY_DSN', '')
+if SENTRY_DSN:
+    import sentry_sdk
+    sentry_sdk.init(dsn=SENTRY_DSN, send_default_pii=False)
+
 
 # ── Ограничитель частоты запросов ("турникет") ──
 # Защищает от того, чтобы один человек или скрипт долбил наш сервер тысячами
