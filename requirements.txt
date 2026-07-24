@@ -4,6 +4,7 @@ flask-cors
 sentry-sdk
 ephem
 pytz
+timezonefinder
 requests
 geopy
 weasyprint

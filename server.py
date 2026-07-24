@@ -920,7 +920,37 @@ def geocode(place_name):
         pass
     return None, None, None
 
-def local_to_ut(year, month, day, hour, minute, lon):
+import pytz
+
+# Историческая база часовых поясов. Раньше пояс считался формулой
+# "долгота ÷ 15" — чистая география, без учёта того, какой пояс РЕАЛЬНО
+# действовал в стране в конкретный год (переходы на летнее время, советское
+# декретное время +1ч и т.д.). Ошибка в 1 час сдвигает Асцендент на ~15° —
+# вплоть до соседнего знака. Теперь определяем реальный пояс по координатам
+# и применяем правила именно на дату рождения.
+try:
+    from timezonefinder import TimezoneFinder
+    _tz_finder = TimezoneFinder()
+except Exception:
+    _tz_finder = None
+
+def local_to_ut(year, month, day, hour, minute, lon, lat=None):
+    # ── Точный путь: историческая база часовых поясов ──
+    if _tz_finder is not None and lat is not None:
+        try:
+            tz_name = _tz_finder.timezone_at(lat=lat, lng=lon)
+            if tz_name:
+                tz = pytz.timezone(tz_name)
+                naive = datetime(year, month, day, hour, minute)
+                # localize сам подставит смещение, которое действовало
+                # в эту дату (включая летнее/декретное время)
+                local_dt = tz.localize(naive, is_dst=None)
+                dt_ut = local_dt.astimezone(pytz.utc)
+                return dt_ut.year, dt_ut.month, dt_ut.day, dt_ut.hour + dt_ut.minute/60.0
+        except Exception:
+            pass  # любая осечка — падаем на старую формулу ниже, не роняя сервер
+
+    # ── Запасной путь: старая формула (если библиотеки нет или пояс не найден) ──
     offset = round(lon / 15)
     total_minutes = hour * 60 + minute - offset * 60
     base = datetime(year, month, day)
@@ -975,7 +1005,12 @@ def calc_asc_mc(year, month, day, h_float, lat, lon):
         lst = (gst + lon) % 360  # местное звёздное время в градусах
 
         # MC (Midheaven)
-        mc_rad = math.atan2(math.tan(math.radians(lst)), math.cos(math.radians(23.4393)))
+        # ИСПРАВЛЕНО 24.07.2026: раньше здесь была формула через tan(), которая
+        # физически не может вернуть угол во второй/третьей четверти круга
+        # (90°-270°) — MC получался ровно на 180° мимо в половине случаев.
+        # Теперь sin/cos считаются отдельно, как уже было сделано для Асцендента.
+        mc_rad = math.atan2(math.sin(math.radians(lst)),
+                            math.cos(math.radians(lst)) * math.cos(math.radians(23.4393)))
         mc = math.degrees(mc_rad) % 360
 
         # Асцендент
@@ -992,7 +1027,7 @@ def calc_asc_mc(year, month, day, h_float, lat, lon):
 
 def calc_natal(year, month, day, hour, minute, lat, lon):
     """Натальный расчёт через ephem"""
-    y, mo, d, h = local_to_ut(year, month, day, hour, minute, lon)
+    y, mo, d, h = local_to_ut(year, month, day, hour, minute, lon, lat)
     date_str = datetime_to_ephem_str(y, mo, d, h)
 
     planets = {}
@@ -1205,7 +1240,7 @@ def get_hd_gate_and_line(lon):
     return gate, line
 
 def calc_human_design(year, month, day, hour, minute, lat, lon):
-    y, mo, d, h = local_to_ut(year, month, day, hour, minute, lon)
+    y, mo, d, h = local_to_ut(year, month, day, hour, minute, lon, lat)
     date_str = datetime_to_ephem_str(y, mo, d, h)
     design_date = ephem.Date(ephem.Date(date_str) - 88)
 
@@ -1552,7 +1587,7 @@ def calc_vimshottari_dasha(year, month, day, hour, minute, lat, lon):
     астрологии. Основана на позиции Луны при рождении.
     """
     try:
-        y, mo, d, h = local_to_ut(year, month, day, hour, minute, lon)
+        y, mo, d, h = local_to_ut(year, month, day, hour, minute, lon, lat)
         date_str = datetime_to_ephem_str(y, mo, d, h)
         moon_tropical = get_planet_lon(ephem.Moon, date_str)
 
