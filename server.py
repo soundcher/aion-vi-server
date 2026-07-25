@@ -13,7 +13,6 @@ import math
 import random
 import hmac
 import hashlib
-import secrets
 import re
 from datetime import datetime, timedelta
 import requests as http_requests
@@ -1873,30 +1872,25 @@ def is_valid_promo_code(code):
 # АДМИН-ПАНЕЛЬ
 # ═══════════════════════════════════════════════════════════════
 # Один пароль, не полноценные логины — панелью пользуется один человек.
-# Сессии живут в памяти сервера (не в базе): при перезапуске Railway
-# все токены сгорают разом, это осознанно — переменных для сравнения
-# в реальном времени тут не нужно, просто зайти заново.
+# ВАЖНО: сервер запущен в двух параллельных процессах (gunicorn --workers 2),
+# у каждого своя отдельная память. Временный пропуск, выданный одним
+# процессом, второй процесс не увидит — вход то работал бы, то нет,
+# через раз. Поэтому пропуска нет вообще: каждый запрос несёт сам пароль
+# и проверяется на месте, какой бы из двух процессов его ни принял.
 
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', '')
-ADMIN_SESSIONS = {}  # token -> datetime истечения
-ADMIN_SESSION_HOURS = 12
-
-
-def _admin_token_from_request():
-    header = request.headers.get('Authorization', '')
-    if not header.startswith('Bearer '):
-        return None
-    return header[7:].strip() or None
 
 
 def require_admin():
     """Возвращает None, если доступ разрешён, иначе — готовый ответ с ошибкой."""
-    token = _admin_token_from_request()
-    if not token or token not in ADMIN_SESSIONS:
+    if not rate_limit_ok('admin_auth', 20, window_seconds=3600):
+        return jsonify({"status": "error", "message": "too_many"}), 429
+    if not ADMIN_PASSWORD:
+        return jsonify({"status": "error", "message": "admin_password_not_configured"}), 500
+    header = request.headers.get('Authorization', '')
+    password = header[7:].strip() if header.startswith('Bearer ') else ''
+    if not password or not hmac.compare_digest(password, ADMIN_PASSWORD):
         return jsonify({"status": "error", "message": "unauthorized"}), 401
-    if datetime.now() > ADMIN_SESSIONS[token]:
-        ADMIN_SESSIONS.pop(token, None)
-        return jsonify({"status": "error", "message": "session_expired"}), 401
     return None
 
 
@@ -1912,9 +1906,7 @@ def admin_login():
     password = data.get('password', '')
     if not hmac.compare_digest(password, ADMIN_PASSWORD):
         return jsonify({"status": "error", "message": "wrong_password"}), 401
-    token = secrets.token_urlsafe(32)
-    ADMIN_SESSIONS[token] = datetime.now() + timedelta(hours=ADMIN_SESSION_HOURS)
-    return jsonify({"status": "ok", "token": token})
+    return jsonify({"status": "ok"})
 
 
 @app.route('/admin/promocodes', methods=['GET'])
