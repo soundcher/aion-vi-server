@@ -13,6 +13,8 @@ import math
 import random
 import hmac
 import hashlib
+import secrets
+import re
 from datetime import datetime, timedelta
 import requests as http_requests
 import anthropic
@@ -318,7 +320,7 @@ def try_use_promo(code, email):
     Дополнительно запоминаем, кому он достался: раньше этого не было, и
     понять, чей код сгорел, было невозможно.
     """
-    if not code or code not in VALID_CODES:
+    if not code or not is_valid_promo_code(code):
         return False
     ref = fb_db.reference(f'used_codes/{code}')
     result = {"already_used": False}
@@ -1851,34 +1853,216 @@ def health():
     return jsonify({"status": "ok", "version": "2.0-ephem"})
 
 
-# ── Промокоды — теперь только на сервере, не видны в исходнике страницы ──
-VALID_CODES = [
-    'AION-GXV-2080','AION-JGQ-0832','AION-SDR-9002','AION-PLJ-2148','AION-MWM-1423',
-    'AION-WZQ-3123','AION-VUR-3083','AION-NML-6099','AION-QSG-1716','AION-GUW-6887',
-    'AION-GDA-0293','AION-XXX-2791','AION-EHF-0821','AION-LXW-9440','AION-BXP-6304',
-    'AION-IZH-8028','AION-MPW-3485','AION-VHT-0181','AION-PBL-5301','AION-JLE-2324',
-    'AION-KSQ-6406','AION-PMY-4592','AION-ALU-3105','AION-VVS-7597','AION-OIU-5848',
-    'AION-ILD-8534','AION-WVJ-0006','AION-MPL-1905','AION-KKU-9413','AION-ZAD-2600',
-    'AION-XTV-7917','AION-VTT-1197','AION-FEY-7893','AION-SKN-0009','AION-JTA-8187',
-    'AION-BNA-2831','AION-QTN-8910','AION-IZU-9276','AION-EWV-2766','AION-RTY-6131',
-    'AION-DYJ-8051','AION-AUH-6315','AION-PVW-0891','AION-CDZ-9473','AION-JCL-5503',
-    'AION-MIC-7411','AION-IMH-6949','AION-RVX-8930','AION-BQY-1478','AION-CDG-4810',
-    # ── Резервная партия, добавлена 16.07.2026 ──
-    'AION-AYW-8308','AION-BLZ-9022','AION-BPN-8190','AION-CKA-2501','AION-CLH-0762',
-    'AION-DFI-5220','AION-DTO-7503','AION-ECL-4476','AION-EMF-4039','AION-EPR-2182',
-    'AION-ESE-3965','AION-FDY-5478','AION-FHC-2126','AION-FIW-9263','AION-FVL-3720',
-    'AION-FYW-3639','AION-GUL-4995','AION-JJF-2966','AION-KFZ-5001','AION-LGG-5258',
-    'AION-LKH-2948','AION-MOG-8425','AION-NEX-8266','AION-OBZ-8998','AION-OVP-1138',
-    'AION-OVQ-8570','AION-PQK-5592','AION-PZR-0826','AION-QAH-2768','AION-QCL-4982',
-    'AION-QFX-8026','AION-QOF-5808','AION-QUK-0395','AION-RVU-2032','AION-SEH-9557',
-    'AION-SFI-9645','AION-SFQ-2498','AION-SGK-6237','AION-SIE-9300','AION-TOL-0089',
-    'AION-UWX-2217','AION-VWA-7398','AION-WKQ-1989','AION-WPU-7593','AION-WVG-7188',
-    'AION-YCM-0771','AION-YDD-1526','AION-YWW-3187','AION-ZCK-3821','AION-ZWA-7652',
-    # ── Довесок до 100 доступных кодов, добавлено 16.07.2026 ──
-    'AION-AFZ-5496','AION-CLC-3035','AION-FOU-7818','AION-FUB-2247','AION-IYN-7442',
-    'AION-JSX-1857','AION-KFE-2723','AION-PKC-1111','AION-ROY-4462','AION-XJK-6168',
-    'AION-ZJF-9175','AION-ZYR-0048'
-]
+# ── Промокоды — теперь живут в Firebase (promo_codes/{КОД}), не в коде ──
+# Раньше список был захардкожен здесь и требовал деплоя на каждый новый
+# код. Управление — через /admin (админ-панель). Старые 112 кодов
+# перенесены через ту же панель одним вставленным списком (25.07.2026).
+
+def is_valid_promo_code(code):
+    """Код действует, если он есть в базе и явно не деактивирован."""
+    if not firebase_db_available or not code:
+        return False
+    try:
+        rec = fb_db.reference(f'promo_codes/{code}').get()
+        return bool(rec) and rec.get('active', True)
+    except Exception:
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════
+# АДМИН-ПАНЕЛЬ
+# ═══════════════════════════════════════════════════════════════
+# Один пароль, не полноценные логины — панелью пользуется один человек.
+# Сессии живут в памяти сервера (не в базе): при перезапуске Railway
+# все токены сгорают разом, это осознанно — переменных для сравнения
+# в реальном времени тут не нужно, просто зайти заново.
+
+ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', '')
+ADMIN_SESSIONS = {}  # token -> datetime истечения
+ADMIN_SESSION_HOURS = 12
+
+
+def _admin_token_from_request():
+    header = request.headers.get('Authorization', '')
+    if not header.startswith('Bearer '):
+        return None
+    return header[7:].strip() or None
+
+
+def require_admin():
+    """Возвращает None, если доступ разрешён, иначе — готовый ответ с ошибкой."""
+    token = _admin_token_from_request()
+    if not token or token not in ADMIN_SESSIONS:
+        return jsonify({"status": "error", "message": "unauthorized"}), 401
+    if datetime.now() > ADMIN_SESSIONS[token]:
+        ADMIN_SESSIONS.pop(token, None)
+        return jsonify({"status": "error", "message": "session_expired"}), 401
+    return None
+
+
+@app.route('/admin/login', methods=['POST'])
+def admin_login():
+    # Щедрый лимит человеку, который просто ошибся пальцем, и жёсткий
+    # потолок для перебора пароля — 5 попыток в час с одного адреса.
+    if not rate_limit_ok('admin_login', 5, window_seconds=3600):
+        return jsonify({"status": "error", "message": "too_many"}), 429
+    if not ADMIN_PASSWORD:
+        return jsonify({"status": "error", "message": "admin_password_not_configured"}), 500
+    data = request.json or {}
+    password = data.get('password', '')
+    if not hmac.compare_digest(password, ADMIN_PASSWORD):
+        return jsonify({"status": "error", "message": "wrong_password"}), 401
+    token = secrets.token_urlsafe(32)
+    ADMIN_SESSIONS[token] = datetime.now() + timedelta(hours=ADMIN_SESSION_HOURS)
+    return jsonify({"status": "ok", "token": token})
+
+
+@app.route('/admin/promocodes', methods=['GET'])
+def admin_list_promocodes():
+    auth_err = require_admin()
+    if auth_err:
+        return auth_err
+    if not firebase_db_available:
+        return jsonify({"status": "error", "message": "service_unavailable"}), 503
+    try:
+        codes = fb_db.reference('promo_codes').get() or {}
+        used_meta = fb_db.reference('used_codes_meta').get() or {}
+        items = []
+        for code, rec in codes.items():
+            rec = rec or {}
+            meta = used_meta.get(code) or {}
+            items.append({
+                'code': code,
+                'active': rec.get('active', True),
+                'note': rec.get('note', ''),
+                'createdAt': rec.get('createdAt', ''),
+                'used': bool(meta),
+                'usedBy': meta.get('email', ''),
+                'usedAt': meta.get('usedAt', ''),
+            })
+        items.sort(key=lambda x: x['createdAt'], reverse=True)
+        return jsonify({"status": "ok", "items": items})
+    except Exception as e:
+        return jsonify({"status": "error", "message": "read_failed"}), 500
+
+
+CODE_PATTERN = re.compile(r'AION-[A-Z0-9]{3}-\d{4}')
+
+
+def parse_promo_lines(raw):
+    """
+    Понимает и голый список кодов (через запятую/пробел/перенос строки),
+    и построчный формат "1. AION-XXX-0000 +++ Имя Фамилия" — так весь
+    список Славы с именами, кому какой код достался, переносится одной
+    вставкой, без переразметки вручную. Разделитель между кодом и именем —
+    любой (+++, -, —, двоеточие, просто пробел).
+    Если на одной строке несколько кодов подряд (голый список через
+    запятую) — это не формат "код+имя", заметку для них не берём, чтобы
+    не приписать чужое имя соседнему коду.
+    Возвращает список (код, заметка).
+    """
+    text = raw if isinstance(raw, str) else '\n'.join(raw)
+    results = []
+    for line in text.splitlines():
+        matches = list(CODE_PATTERN.finditer(line))
+        if not matches:
+            continue
+        if len(matches) > 1:
+            for m in matches:
+                results.append((m.group(0), ''))
+            continue
+        m = matches[0]
+        code = m.group(0)
+        rest = line[m.end():].strip()
+        rest = re.sub(r'^[\s:+\-—–]+', '', rest).strip()
+        results.append((code, rest[:200]))
+    return results
+
+
+@app.route('/admin/promocodes/add', methods=['POST'])
+def admin_add_promocodes():
+    auth_err = require_admin()
+    if auth_err:
+        return auth_err
+    if not firebase_db_available:
+        return jsonify({"status": "error", "message": "service_unavailable"}), 503
+    data = request.json or {}
+    # Принимает и голый список кодов, и построчный "код + кому достался" —
+    # см. parse_promo_lines. Так вставить сразу 112 старых кодов, часть из
+    # которых уже подписана именами, можно одной вставкой из буфера обмена.
+    raw = data.get('codes', '')
+    pairs = parse_promo_lines(raw)
+    added, skipped = [], []
+    for code, note in pairs:
+        try:
+            existing = fb_db.reference(f'promo_codes/{code}').get()
+            if existing:
+                skipped.append(code)
+                continue
+            fb_db.reference(f'promo_codes/{code}').set({
+                'active': True,
+                'createdAt': datetime.now().isoformat(),
+                'note': note,
+            })
+            added.append(code)
+        except Exception:
+            skipped.append(code)
+    return jsonify({"status": "ok", "added": added, "skipped": skipped})
+
+
+@app.route('/admin/promocodes/delete', methods=['POST'])
+def admin_delete_promocode():
+    auth_err = require_admin()
+    if auth_err:
+        return auth_err
+    if not firebase_db_available:
+        return jsonify({"status": "error", "message": "service_unavailable"}), 503
+    data = request.json or {}
+    code = (data.get('code') or '').strip().upper()
+    if not code:
+        return jsonify({"status": "error", "message": "empty"}), 400
+    try:
+        fb_db.reference(f'promo_codes/{code}').delete()
+        return jsonify({"status": "ok"})
+    except Exception:
+        return jsonify({"status": "error", "message": "delete_failed"}), 500
+
+
+@app.route('/admin/stats', methods=['GET'])
+def admin_stats():
+    auth_err = require_admin()
+    if auth_err:
+        return auth_err
+    if not firebase_db_available:
+        return jsonify({"status": "error", "message": "service_unavailable"}), 503
+    try:
+        users = fb_db.reference('users').get() or {}
+        promo_codes = fb_db.reference('promo_codes').get() or {}
+        used_codes = fb_db.reference('used_codes').get() or {}
+
+        by_tier = defaultdict(int)
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        signups_today = 0
+        for u in users.values():
+            if not isinstance(u, dict):
+                continue
+            tier = u.get('subscriptionTier') or 'free'
+            by_tier[tier] += 1
+            created = u.get('registeredAt', '')
+            if created.startswith(today_str):
+                signups_today += 1
+
+        return jsonify({
+            "status": "ok",
+            "totalUsers": len(users),
+            "byTier": dict(by_tier),
+            "signupsToday": signups_today,
+            "promoCodesTotal": len(promo_codes),
+            "promoCodesUsed": sum(1 for v in used_codes.values() if v),
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "message": "read_failed"}), 500
+
 
 LEMONSQUEEZY_WEBHOOK_SECRET = os.environ.get('LEMONSQUEEZY_WEBHOOK_SECRET', '')
 
@@ -2104,7 +2288,7 @@ def redeem():
 
     if not code:
         return jsonify({"valid": False, "reason": "empty"}), 400
-    if code not in VALID_CODES:
+    if not is_valid_promo_code(code):
         return jsonify({"valid": False, "reason": "not_found"}), 404
     if not firebase_db_available:
         return jsonify({"valid": False, "reason": "service_unavailable"}), 503
