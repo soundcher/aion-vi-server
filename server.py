@@ -45,6 +45,16 @@ CRISIS_ADDENDUM = {
     'Respond in English.': "\n\n---\nWhat you just wrote sounds genuinely heavy. Please don't carry this alone — talk to someone close to you or a professional who knows how to help in moments like this. I'm glad to be here for the conversation, but I can't replace real support when it's truly needed.",
 }
 
+# Сбой Anthropic API — раньше пользователь видел сырой текст исключения
+# (str(e)), теперь тёплое сообщение в голосе AION Vi. Технический текст
+# по-прежнему пишется в лог (см. except-блоки ниже) — для нас и для Sentry.
+FRIENDLY_API_ERROR = {
+    'Отвечай на русском языке.': "Пум-пурум-пум-пууум!.. Прости, чёт я походу не то сделал... Дай мне немного времени или напиши мне. Я постараюсь разобраться максимально быстро!",
+    'Відповідай українською мовою.': "Пум-пурум-пум-пууум!.. Вибач, щось я, здається, не те зробив... Дай мені трохи часу або напиши мені. Я постараюся розібратися якнайшвидше!",
+    'Odpowiadaj po polsku.': "Pum-pa-rum-pum-puuum!.. Przepraszam, chyba coś mi nie wyszło... Daj mi chwilę albo napisz do mnie. Postaram się to ogarnąć najszybciej, jak się da!",
+    'Respond in English.': "Pum-pa-rum-pum-puuum!.. Sorry, looks like I got something wrong there... Give me a little time, or write to me — I'll sort it out as fast as I can!",
+}
+
 def detect_crisis(text):
     if not text:
         return False
@@ -3230,7 +3240,9 @@ def generate_analysis():
     except anthropic.RateLimitError:
         return jsonify({"status": "error", "message": "Превышен лимит запросов, подожди минуту"}), 429
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        print(f"⚠️ Ошибка Anthropic API в /generate (личный запрос): {e}")
+        li = data.get('lang_instruction', 'Отвечай на русском языке.') if isinstance(data, dict) else 'Отвечай на русском языке.'
+        return jsonify({"status": "error", "message": FRIENDLY_API_ERROR.get(li, FRIENDLY_API_ERROR['Отвечай на русском языке.'])}), 500
 
 @app.route('/monthly-digest', methods=['POST'])
 def monthly_digest():
@@ -3367,7 +3379,9 @@ def monthly_digest():
     except anthropic.RateLimitError:
         return jsonify({"status": "error", "message": "Превышен лимит запросов, подожди минуту"}), 429
     except Exception as e:
-        return jsonify({"status": "error", "message": str(e)}), 500
+        print(f"⚠️ Ошибка Anthropic API в /monthly-digest: {e}")
+        li = data.get('lang_instruction', 'Отвечай на русском языке.') if isinstance(data, dict) else 'Отвечай на русском языке.'
+        return jsonify({"status": "error", "message": FRIENDLY_API_ERROR.get(li, FRIENDLY_API_ERROR['Отвечай на русском языке.'])}), 500
 
 
 if __name__ == '__main__':
