@@ -13,6 +13,7 @@ import math
 import random
 import hmac
 import hashlib
+import secrets
 import re
 from datetime import datetime, timedelta
 import requests as http_requests
@@ -315,32 +316,82 @@ def build_profile(key):
 
 def try_use_promo(code, email):
     """
-    Помечает промокод использованным — атомарно, только если он ещё свободен.
-    Дополнительно запоминаем, кому он достался: раньше этого не было, и
-    понять, чей код сгорел, было невозможно.
+    Погашает промокод — атомарно, без гонки при параллельных попытках.
+    Возвращает количество запросов на начисление (своё у каждого кода,
+    не общее число на все), или None, если код не принят.
+
+    Одноразовые — прежняя логика, флаг used_codes/{код}, без изменений.
+    Многоразовые (акции на N человек) — свой счётчик usedCount с лимитом
+    maxUses, плюс отметка per-user в redeemedBy, чтобы один и тот же
+    человек не мог погасить один акционный код дважды.
     """
-    if not code or not is_valid_promo_code(code):
-        return False
-    ref = fb_db.reference(f'used_codes/{code}')
-    result = {"already_used": False}
-
-    def txn(current):
-        if current:
-            result["already_used"] = True
-            return current
-        return True
-
-    ref.transaction(txn)
-    if result["already_used"]:
-        return False
+    if not code or not firebase_db_available:
+        return None
     try:
-        fb_db.reference(f'used_codes_meta/{code}').set({
-            'email': email,
-            'usedAt': datetime.now().isoformat(),
-        })
+        promo = fb_db.reference(f'promo_codes/{code}').get()
     except Exception:
-        pass
-    return True
+        return None
+    if not promo or not promo.get('active', True):
+        return None
+
+    grant = promo.get('analysesGrant', ANALYSES_PER_PROMO)
+    is_multi = promo.get('type') == 'multi'
+
+    if not is_multi:
+        ref = fb_db.reference(f'used_codes/{code}')
+        result = {"already_used": False}
+
+        def txn(current):
+            if current:
+                result["already_used"] = True
+                return current
+            return True
+
+        ref.transaction(txn)
+        if result["already_used"]:
+            return None
+        try:
+            fb_db.reference(f'used_codes_meta/{code}').set({
+                'email': email,
+                'usedAt': datetime.now().isoformat(),
+            })
+        except Exception:
+            pass
+        return grant
+
+    # ── Многоразовый код ──
+    user_key = email_to_key(email)
+    redeemed_ref = fb_db.reference(f'promo_codes/{code}/redeemedBy/{user_key}')
+    claim = {'email': email, 'usedAt': datetime.now().isoformat()}
+    already = {"done": False}
+
+    def claim_txn(current):
+        if current:
+            already["done"] = True
+            return current
+        return claim
+
+    redeemed_ref.transaction(claim_txn)
+    if already["done"]:
+        return None  # этот человек уже гасил этот код раньше
+
+    max_uses = promo.get('maxUses', 1)
+    count_ref = fb_db.reference(f'promo_codes/{code}/usedCount')
+    result = {"allowed": False}
+
+    def count_txn(current):
+        current = current or 0
+        if current >= max_uses:
+            result["allowed"] = False
+            return current  # лимит исчерпан — не меняем счётчик
+        result["allowed"] = True
+        return current + 1
+
+    count_ref.transaction(count_txn)
+    if not result["allowed"]:
+        redeemed_ref.delete()  # лимит исчерпан именно на этой попытке — откатываем личную отметку
+        return None
+    return grant
 
 
 def verify_telegram_payload(payload):
@@ -463,15 +514,19 @@ def auth_register():
         }), 429
 
     promo_applied = False
-    if promo and try_use_promo(promo, email):
-        promo_applied = True
+    promo_grant = 0
+    if promo:
+        result = try_use_promo(promo, email)
+        if result is not None:
+            promo_applied = True
+            promo_grant = result
 
     # Бесплатные запросы выдаются СРАЗУ. Подтверждение почты здесь было бы
     # защитой от фиктивных регистраций, но цена вопроса — центы токенов,
     # а плата за неё — минута жизни каждого честного человека и выход из
     # приложения в почтовый ящик. На этапе привлечения это невыгодный обмен.
     # Фиктивные регистрации ограничивает лимит по адресу (см. ниже).
-    base = ANALYSES_PER_PROMO if promo_applied else FREE_ANALYSES_ON_SIGNUP
+    base = promo_grant if promo_applied else FREE_ANALYSES_ON_SIGNUP
 
     record = {
         'email': email,
@@ -1922,16 +1977,41 @@ def admin_list_promocodes():
         items = []
         for code, rec in codes.items():
             rec = rec or {}
-            meta = used_meta.get(code) or {}
-            items.append({
-                'code': code,
-                'active': rec.get('active', True),
-                'note': rec.get('note', ''),
-                'createdAt': rec.get('createdAt', ''),
-                'used': bool(meta),
-                'usedBy': meta.get('email', ''),
-                'usedAt': meta.get('usedAt', ''),
-            })
+            is_multi = rec.get('type') == 'multi'
+            grant = rec.get('analysesGrant', ANALYSES_PER_PROMO)
+            if is_multi:
+                used_count = rec.get('usedCount', 0)
+                max_uses = rec.get('maxUses', 1)
+                redeemed_by = rec.get('redeemedBy') or {}
+                # Последний по времени, для колонки "когда" — акционный код
+                # используют многие, показывать всех в одной строке смысла нет.
+                latest = max(redeemed_by.values(), key=lambda v: v.get('usedAt', ''), default={})
+                items.append({
+                    'code': code,
+                    'active': rec.get('active', True),
+                    'note': rec.get('note', ''),
+                    'createdAt': rec.get('createdAt', ''),
+                    'type': 'multi',
+                    'grant': grant,
+                    'used': used_count >= max_uses,
+                    'usedCount': used_count,
+                    'maxUses': max_uses,
+                    'usedBy': f'{used_count} из {max_uses}',
+                    'usedAt': latest.get('usedAt', ''),
+                })
+            else:
+                meta = used_meta.get(code) or {}
+                items.append({
+                    'code': code,
+                    'active': rec.get('active', True),
+                    'note': rec.get('note', ''),
+                    'createdAt': rec.get('createdAt', ''),
+                    'type': 'single',
+                    'grant': grant,
+                    'used': bool(meta),
+                    'usedBy': meta.get('email', ''),
+                    'usedAt': meta.get('usedAt', ''),
+                })
         items.sort(key=lambda x: x['createdAt'], reverse=True)
         return jsonify({"status": "ok", "items": items})
     except Exception as e:
@@ -1969,6 +2049,56 @@ def parse_promo_lines(raw):
         rest = re.sub(r'^[\s:+\-—–]+', '', rest).strip()
         results.append((code, rest[:200]))
     return results
+
+
+def generate_promo_code():
+    """Один код в привычном формате AION-XXX-0000, гарантированно свободный."""
+    alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+    for _ in range(20):  # запас на случай редчайшего совпадения
+        code = 'AION-' + ''.join(secrets.choice(alphabet) for _ in range(3)) + '-' + \
+               ''.join(secrets.choice('0123456789') for _ in range(4))
+        if not fb_db.reference(f'promo_codes/{code}').get():
+            return code
+    raise RuntimeError('не удалось подобрать свободный код')
+
+
+@app.route('/admin/promocodes/generate', methods=['POST'])
+def admin_generate_promocode():
+    auth_err = require_admin()
+    if auth_err:
+        return auth_err
+    if not firebase_db_available:
+        return jsonify({"status": "error", "message": "service_unavailable"}), 503
+    data = request.json or {}
+    try:
+        analyses_grant = int(data.get('analysesGrant', ANALYSES_PER_PROMO))
+        promo_type = 'multi' if data.get('type') == 'multi' else 'single'
+        max_uses = int(data.get('maxUses', 1)) if promo_type == 'multi' else 1
+
+        # Разумные пределы — не запрет, а страховка от опечатки лишним
+        # нулём (100000 запросов одному человеку — почти наверняка ошибка).
+        if not (1 <= analyses_grant <= 1000):
+            return jsonify({"status": "error", "message": "bad_grant"}), 400
+        if promo_type == 'multi' and not (1 <= max_uses <= 100000):
+            return jsonify({"status": "error", "message": "bad_max_uses"}), 400
+
+        code = generate_promo_code()
+        entry = {
+            'active': True,
+            'createdAt': datetime.now().isoformat(),
+            'note': (data.get('note') or '').strip()[:200],
+            'type': promo_type,
+            'analysesGrant': analyses_grant,
+        }
+        if promo_type == 'multi':
+            entry['maxUses'] = max_uses
+            entry['usedCount'] = 0
+        fb_db.reference(f'promo_codes/{code}').set(entry)
+        return jsonify({"status": "ok", "code": code})
+    except (TypeError, ValueError):
+        return jsonify({"status": "error", "message": "bad_input"}), 400
+    except Exception:
+        return jsonify({"status": "error", "message": "generate_failed"}), 500
 
 
 @app.route('/admin/promocodes/add', methods=['POST'])
