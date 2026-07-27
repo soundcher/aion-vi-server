@@ -1,0 +1,17 @@
+name: Daily inactivity push check
+
+on:
+  schedule:
+    # 18:00 по Києву/Варшаві влітку (UTC+3) — 15:00 UTC.
+    # Час обраний як спокійний вечірній час, не глибока ніч і не робочий день.
+    - cron: '0 15 * * *'
+  workflow_dispatch: {}   # можна запустити вручну з вкладки Actions для перевірки
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /cron/daily-push-check
+        run: |
+          curl -sf -X POST "https://aion-vi-server-production.up.railway.app/cron/daily-push-check" \
+            -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}"

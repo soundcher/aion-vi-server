@@ -2827,10 +2827,16 @@ def summary():
                 retro = " ℞" if planets[p].get("retrograde") else ""
                 lines.append(f"{p}: {planets[p]['formatted']}{retro}")
         houses = nat.get('houses', {})
-        if "Асцендент" in houses:
-            lines.append(f"Асцендент: {houses['Асцендент']['formatted']}")
-        if "MC (Середина Неба)" in houses:
-            lines.append(f"MC: {houses['MC (Середина Неба)']['formatted']}")
+        # Без точного времени рождения Асцендент/MC/дома считаются по
+        # подставленным 12:00 — это не приближение, а другой человек.
+        # Раньше эти строки всё равно попадали в текст для ИИ, и он мог
+        # сослаться на них как на настоящие данные, несмотря на отдельную
+        # мягкую оговорку в инструкции. Теперь их просто нет в тексте.
+        if not data.get('no_time'):
+            if "Асцендент" in houses:
+                lines.append(f"Асцендент: {houses['Асцендент']['formatted']}")
+            if "MC (Середина Неба)" in houses:
+                lines.append(f"MC: {houses['MC (Середина Неба)']['formatted']}")
         lines.append("")
 
         lines.append("── ДИЗАЙН ЧЕЛОВЕКА ──")
