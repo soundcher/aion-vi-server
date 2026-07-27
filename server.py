@@ -15,6 +15,8 @@ import hmac
 import hashlib
 import secrets
 import re
+import smtplib
+from email.mime.text import MIMEText
 from datetime import datetime, timedelta
 import requests as http_requests
 import anthropic
@@ -2289,6 +2291,90 @@ CREEM_PRODUCT_TIERS = {
     'prod_1ucuYSXljSqUOJvVQrsWn':  {'analyses': 40, 'tier': 'pro'},
 }
 
+# ── Письмо-квитанция после оплаты ──
+# Раньше после оплаты не было ни письма, ни подтверждения — человек платил
+# и просто возвращался в приложение, не зная, прошли ли деньги. Отправляем
+# только на subscription.paid (см. комментарий у /webhooks/creem) — это
+# событие срабатывает и на первую оплату, и на каждое продление, без дублей.
+GMAIL_SENDER = 'soundcher11@gmail.com'
+GMAIL_APP_PASSWORD = os.environ.get('GMAIL_APP_PASSWORD', '')
+
+TIER_DISPLAY = {
+    'start': {'name_ru': 'Старт', 'name_uk': 'Старт', 'name_pl': 'Start', 'name_en': 'Start', 'price': '€9.99'},
+    'basic': {'name_ru': 'Базовый', 'name_uk': 'Базовий', 'name_pl': 'Podstawowy', 'name_en': 'Basic', 'price': '€19.99'},
+    'pro':   {'name_ru': 'Про', 'name_uk': 'Про', 'name_pl': 'Pro', 'name_en': 'Pro', 'price': '€29.99'},
+}
+
+RECEIPT_EMAIL_TEXT = {
+    'ru': {
+        'subject': lambda tier_name: f'AION Vi — оплата пакета «{tier_name}» прошла',
+        'body': lambda tier_name, price, analyses: (
+            f"Привет!\n\n"
+            f"Оплата пакета «{tier_name}» ({price}/мес) прошла — на счёт начислено {analyses} запросов.\n\n"
+            f"Можешь возвращаться в приложение и продолжать: https://aion-vi.web.app/calculator.html\n\n"
+            f"Если что-то не сходится — просто ответь на это письмо, отвечаю лично.\n\n"
+            f"Слава, AION Vi"
+        ),
+    },
+    'uk': {
+        'subject': lambda tier_name: f'AION Vi — оплата пакета «{tier_name}» пройшла',
+        'body': lambda tier_name, price, analyses: (
+            f"Привіт!\n\n"
+            f"Оплата пакета «{tier_name}» ({price}/міс.) пройшла — на рахунок нараховано {analyses} запитів.\n\n"
+            f"Можеш повертатися в застосунок і продовжувати: https://aion-vi.web.app/calculator.html\n\n"
+            f"Якщо щось не сходиться — просто дай відповідь на цей лист, відповідаю особисто.\n\n"
+            f"Слава, AION Vi"
+        ),
+    },
+    'pl': {
+        'subject': lambda tier_name: f'AION Vi — płatność za pakiet „{tier_name}” przyjęta',
+        'body': lambda tier_name, price, analyses: (
+            f"Cześć!\n\n"
+            f"Płatność za pakiet „{tier_name}” ({price}/mies.) przyjęta — na koncie doliczono {analyses} zapytań.\n\n"
+            f"Możesz wrócić do aplikacji: https://aion-vi.web.app/calculator.html\n\n"
+            f"Jeśli coś się nie zgadza — po prostu odpowiedz na tego maila, odpowiadam osobiście.\n\n"
+            f"Slava, AION Vi"
+        ),
+    },
+    'en': {
+        'subject': lambda tier_name: f'AION Vi — payment for the "{tier_name}" plan received',
+        'body': lambda tier_name, price, analyses: (
+            f"Hi!\n\n"
+            f"Your payment for the \"{tier_name}\" plan ({price}/mo) went through — {analyses} requests added to your account.\n\n"
+            f"You can head back to the app: https://aion-vi.web.app/calculator.html\n\n"
+            f"If anything looks off — just reply to this email, I answer personally.\n\n"
+            f"Slava, AION Vi"
+        ),
+    },
+}
+
+
+def send_receipt_email(to_email, tier_code, analyses, lang='ru'):
+    """
+    Письмо-квитанция после оплаты. Любой сбой здесь — только в лог, никогда
+    не поднимается наружу: начисление пакета важнее письма о нём, и одно
+    не должно ломать другое.
+    """
+    if not GMAIL_APP_PASSWORD or not to_email:
+        return
+    try:
+        disp = TIER_DISPLAY.get(tier_code, TIER_DISPLAY['start'])
+        lang_key = lang if lang in RECEIPT_EMAIL_TEXT else 'ru'
+        tier_name = disp.get(f'name_{lang_key}', disp['name_ru'])
+        texts = RECEIPT_EMAIL_TEXT[lang_key]
+
+        msg = MIMEText(texts['body'](tier_name, disp['price'], analyses), 'plain', 'utf-8')
+        msg['Subject'] = texts['subject'](tier_name)
+        msg['From'] = f'AION Vi <{GMAIL_SENDER}>'
+        msg['To'] = to_email
+
+        with smtplib.SMTP('smtp.gmail.com', 587, timeout=10) as server:
+            server.starttls()
+            server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
+            server.send_message(msg)
+    except Exception as e:
+        print(f"⚠️ Не удалось отправить письмо-квитанцию: {e}")
+
 @app.route('/webhooks/creem', methods=['POST'])
 def creem_webhook():
     raw_body = request.get_data()  # сырое тело — обязательно для проверки подписи
@@ -2334,6 +2420,15 @@ def creem_webhook():
                     'subscriptionTier': tier_data['tier'],
                     'subscriptionStatus': 'active',
                 })
+                # Письмо шлём только здесь, не на checkout.completed — оба
+                # события приходят почти одновременно при первой оплате,
+                # иначе человек получил бы два одинаковых письма подряд.
+                if event_type == 'subscription.paid':
+                    user_rec = fb_db.reference(f'users/{key}').get() or {}
+                    send_receipt_email(
+                        user_email, tier_data['tier'], tier_data['analyses'],
+                        lang=user_rec.get('lang', 'ru')
+                    )
             except Exception as e:
                 print(f"⚠️ Ошибка обновления после оплаты (Creem): {e}")
 
