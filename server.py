@@ -2375,6 +2375,38 @@ def send_receipt_email(to_email, tier_code, analyses, lang='ru'):
     except Exception as e:
         print(f"⚠️ Не удалось отправить письмо-квитанцию: {e}")
 
+
+@app.route('/admin/test-receipt-email', methods=['GET'])
+def admin_test_receipt_email():
+    password = request.args.get('password', '')
+    if not ADMIN_PASSWORD or not hmac.compare_digest(password, ADMIN_PASSWORD):
+        return jsonify({"status": "error", "message": "unauthorized"}), 401
+    to_email = request.args.get('to_email', '').strip()
+    if not to_email:
+        return jsonify({"status": "error", "message": "to_email_required"}), 400
+    if not GMAIL_APP_PASSWORD:
+        return jsonify({"status": "error", "message": "gmail_app_password_not_configured"}), 500
+    tier_code = request.args.get('tier_code', 'pro')
+    analyses = int(request.args.get('analyses', 40))
+    lang = request.args.get('lang', 'ru')
+    try:
+        disp = TIER_DISPLAY.get(tier_code, TIER_DISPLAY['start'])
+        lang_key = lang if lang in RECEIPT_EMAIL_TEXT else 'ru'
+        tier_name = disp.get(f'name_{lang_key}', disp['name_ru'])
+        texts = RECEIPT_EMAIL_TEXT[lang_key]
+        msg = MIMEText(texts['body'](tier_name, disp['price'], analyses), 'plain', 'utf-8')
+        msg['Subject'] = texts['subject'](tier_name)
+        msg['From'] = f'AION Vi <{GMAIL_SENDER}>'
+        msg['To'] = to_email
+        with smtplib.SMTP('smtp.gmail.com', 587, timeout=10) as server:
+            server.starttls()
+            server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
+            server.send_message(msg)
+        return jsonify({"status": "ok", "message": "sent"})
+    except Exception as e:
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+
 @app.route('/webhooks/creem', methods=['POST'])
 def creem_webhook():
     raw_body = request.get_data()  # сырое тело — обязательно для проверки подписи
