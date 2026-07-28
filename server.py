@@ -2725,6 +2725,15 @@ def generate_pdf():
         analysis = data.get('analysis', '')
         name = data.get('name', '—')
         birthdate = data.get('birthdate', '—')
+        lang = data.get('lang', 'ru')
+        if lang not in ('ru', 'uk', 'pl', 'en'):
+            lang = 'ru'
+        PDF_TEXT = {
+            'ru': {'sub': 'Персональный навигатор', 'footer': 'Персональный ответ создан специально для тебя'},
+            'uk': {'sub': 'Персональний навігатор', 'footer': 'Персональна відповідь створена спеціально для тебе'},
+            'pl': {'sub': 'Osobisty nawigator', 'footer': 'Osobista odpowiedź stworzona specjalnie dla Ciebie'},
+            'en': {'sub': 'Personal Navigator', 'footer': 'A personal answer created just for you'},
+        }[lang]
 
         if not analysis:
             return jsonify({"status": "error", "message": "Нет текста ответа"}), 400
@@ -2816,12 +2825,12 @@ def generate_pdf():
 <body>
 <div class="header">
   <div class="brand">AION Vi</div>
-  <div class="sub">Персональный навигатор</div>
+  <div class="sub">{PDF_TEXT['sub']}</div>
   <div class="client-name">{name}</div>
   <div class="client-date">{birthdate}</div>
 </div>
 <div class="body">{analysis}</div>
-<div class="footer">AION Vi · Персональный ответ создан специально для тебя</div>
+<div class="footer">AION Vi · {PDF_TEXT['footer']}</div>
 </body>
 </html>"""
 
@@ -3562,11 +3571,15 @@ def monthly_digest():
             'createdAt': now.isoformat(),
         })
         client_info = data.get('client_info', {}) or {}
+        digest_label = {
+            'ru': 'Обзор месяца', 'uk': 'Огляд місяця',
+            'pl': 'Przegląd miesiąca', 'en': 'Monthly overview',
+        }.get(data.get('lang', 'ru'), 'Обзор месяца')
         fb_db.reference(f'history/{key}').push({
             'createdAt': now.isoformat(),
             'firstname': client_info.get('firstname', ''),
             'lastname': client_info.get('lastname', ''),
-            'request': 'Огляд місяця',
+            'request': digest_label,
             'analysis': analysis_text,
         })
 
