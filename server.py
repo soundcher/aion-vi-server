@@ -2318,9 +2318,9 @@ RECEIPT_EMAIL_TEXT = {
         'body': lambda tier_name, price, analyses: (
             f"Привет!\n\n"
             f"Оплата пакета «{tier_name}» ({price}/мес) прошла — на счёт начислено {analyses} запросов.\n\n"
-            f"Можешь возвращаться в приложение и продолжать: https://aion-vi.web.app/calculator.html\n\n"
-            f"Если что-то не сходится — просто ответь на это письмо, отвечаю лично.\n\n"
-            f"Слава, AION Vi"
+            f"Возвращайся в приложение и продолжай: https://aion-vi.web.app/calculator.html\n\n"
+            f"Если что-то не сходится — просто ответь на это письмо. Я отреагирую сразу, как только смогу.\n\n"
+            f"AION Vi"
         ),
     },
     'uk': {
@@ -2328,9 +2328,9 @@ RECEIPT_EMAIL_TEXT = {
         'body': lambda tier_name, price, analyses: (
             f"Привіт!\n\n"
             f"Оплата пакета «{tier_name}» ({price}/міс.) пройшла — на рахунок нараховано {analyses} запитів.\n\n"
-            f"Можеш повертатися в застосунок і продовжувати: https://aion-vi.web.app/calculator.html\n\n"
-            f"Якщо щось не сходиться — просто дай відповідь на цей лист, відповідаю особисто.\n\n"
-            f"Слава, AION Vi"
+            f"Повертайся в застосунок і продовжуй: https://aion-vi.web.app/calculator.html\n\n"
+            f"Якщо щось не сходиться — просто дай відповідь на цей лист. Я відреагую, щойно зможу.\n\n"
+            f"AION Vi"
         ),
     },
     'pl': {
@@ -2338,9 +2338,9 @@ RECEIPT_EMAIL_TEXT = {
         'body': lambda tier_name, price, analyses: (
             f"Cześć!\n\n"
             f"Płatność za pakiet „{tier_name}” ({price}/mies.) przyjęta — na koncie doliczono {analyses} zapytań.\n\n"
-            f"Możesz wrócić do aplikacji: https://aion-vi.web.app/calculator.html\n\n"
-            f"Jeśli coś się nie zgadza — po prostu odpowiedz na tego maila, odpowiadam osobiście.\n\n"
-            f"Slava, AION Vi"
+            f"Wróć do aplikacji i kontynuuj: https://aion-vi.web.app/calculator.html\n\n"
+            f"Jeśli coś się nie zgadza — po prostu odpowiedz na tego maila. Odezwę się, jak tylko będę mógł.\n\n"
+            f"AION Vi"
         ),
     },
     'en': {
@@ -2348,9 +2348,9 @@ RECEIPT_EMAIL_TEXT = {
         'body': lambda tier_name, price, analyses: (
             f"Hi!\n\n"
             f"Your payment for the \"{tier_name}\" plan ({price}/mo) went through — {analyses} requests added to your account.\n\n"
-            f"You can head back to the app: https://aion-vi.web.app/calculator.html\n\n"
-            f"If anything looks off — just reply to this email, I answer personally.\n\n"
-            f"Slava, AION Vi"
+            f"Head back to the app and continue: https://aion-vi.web.app/calculator.html\n\n"
+            f"If anything looks off — just reply to this email. I'll get back to you as soon as I can.\n\n"
+            f"AION Vi"
         ),
     },
 }
@@ -2369,6 +2369,12 @@ def _send_via_sendgrid(to_email, subject, body_text):
         "from": {"email": GMAIL_SENDER, "name": "AION Vi"},
         "subject": subject,
         "content": [{"type": "text/plain", "value": body_text}],
+        # Иначе SendGrid переписывает обычную текстовую ссылку в письме на
+        # свой редирект-домен (sendgrid.net) — получилась кривая длинная
+        # ссылка вместо чистой aion-vi.web.app.
+        "tracking_settings": {
+            "click_tracking": {"enable": False, "enable_text": False}
+        },
     }
     try:
         resp = http_requests.post(
