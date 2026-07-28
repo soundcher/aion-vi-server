@@ -1860,24 +1860,137 @@ def calc_lunar_return(natal_moon_lon, natal_asc_lon, year, month):
         "orb": round(best_diff, 2),
     }
 
-def find_markers(profection_house, dasha_planet, lunar_house=None):
+def calc_progressed_moon_house(year, month, day, hour, minute, lat, lon, natal_asc_lon):
+    """
+    Прогрессии (вторичные, "день за год") — классическая техника: один
+    день после рождения символически равен одному году жизни. Берём Луну —
+    самую быструю точку карты, её положение заметнее всего смещается со
+    временем и потому лучше всего показывает "текущую главу" жизни (смена
+    примерно раз в 2.5 года — свой, отдельный от профекции и даши ритм).
+
+    Точка отсчёта — не "сегодня минус N лет", а ровно N дней ПОСЛЕ момента
+    рождения, где N = сколько лет человеку сейчас (включая дробную часть,
+    посчитанную по реально прошедшим суткам, а не округлением). Дом —
+    та же система равных домов от Асцендента, что и в лунаре и транзитах,
+    поэтому результат сразу совместим с MARKER_CATEGORIES.
+    """
+    if natal_asc_lon is None:
+        return None
+    try:
+        y, mo, d, h = local_to_ut(year, month, day, hour, minute, lon, lat)
+        birth_ut = datetime(y, mo, d) + timedelta(hours=h)
+        elapsed_days = (datetime.utcnow() - birth_ut).total_seconds() / 86400.0
+        age_years = elapsed_days / 365.25
+        progressed_dt = birth_ut + timedelta(days=age_years)
+        date_str = datetime_to_ephem_str(
+            progressed_dt.year, progressed_dt.month, progressed_dt.day,
+            progressed_dt.hour + progressed_dt.minute / 60.0
+        )
+        moon_lon = get_planet_lon(ephem.Moon, date_str)
+    except Exception:
+        return None
+
+    house = int(((moon_lon - natal_asc_lon) % 360) / 30) + 1
+    return {"house": house, "age_years": round(age_years, 2)}
+
+
+def calc_solar_return_house(natal_sun_lon, natal_asc_lon, age, birth_year, birth_month, birth_day):
+    """
+    Соляр (солнечное возвращение) — раз в год транзитное Солнце проходит
+    ровно ту же точку неба, что и в момент рождения человека. В отличие
+    от профекции (символический счёт: возраст % 12, без обращения к
+    эфемеридам), это НАСТОЯЩИЙ астрономический расчёт конкретной даты.
+
+    Ищем эту дату рядом с ближайшим днём рождения — Солнце движется
+    ~1°/сутки, так что точное совпадение попадает в узкое окно в
+    несколько дней вокруг календарной даты, весь год сканировать не
+    нужно. Дом — снова система равных домов от натального Асцендента,
+    переиспользует MARKER_CATEGORIES. Если профекция (эвристика) и соляр
+    (настоящий расчёт) указывают на один и тот же дом — это особенно
+    веское подтверждение, а не совпадение двух похожих оценок.
+    """
+    if natal_sun_lon is None or natal_asc_lon is None:
+        return None
+
+    return_year = birth_year + age
+    try:
+        anchor = datetime(return_year, birth_month, birth_day)
+    except ValueError:
+        anchor = datetime(return_year, birth_month, 28)  # 29 февраля в невисокосный год
+
+    best_diff, best_date = 999.0, None
+    for offset in range(-5, 6):
+        day_dt = anchor + timedelta(days=offset)
+        date_str = datetime_to_ephem_str(day_dt.year, day_dt.month, day_dt.day, 12.0)
+        try:
+            sun_lon = get_planet_lon(ephem.Sun, date_str)
+        except Exception:
+            continue
+        diff = abs(sun_lon - natal_sun_lon)
+        if diff > 180:
+            diff = 360 - diff
+        if diff < best_diff:
+            best_diff, best_date = diff, day_dt
+
+    if best_date is None or best_diff > 1.0:
+        return None
+
+    date_str = datetime_to_ephem_str(best_date.year, best_date.month, best_date.day, 12.0)
+    sun_lon = get_planet_lon(ephem.Sun, date_str)
+    house = int(((sun_lon - natal_asc_lon) % 360) / 30) + 1
+
+    return {"date": best_date.strftime('%d.%m.%Y'), "house": house, "orb": round(best_diff, 2)}
+
+
+def calc_directed_moon_house(natal_moon_lon, natal_asc_lon, birth_year, birth_month, birth_day):
+    """
+    Дирекции (по дуге, "arc directions") — принципиально другой темп, чем
+    у прогрессий выше. Там Луна двигалась своим НАСТОЯЩИМ ходом на
+    символической дате (ephemeris-расчёт). Здесь любая точка карты
+    сдвигается на ОДНУ И ТУ ЖЕ усреднённую дугу — средний суточный ход
+    Солнца (~0.9856° в год) умноженный на возраст. Дом от этого меняется
+    примерно раз в 30 лет, а не раз в 2.5 года — это не баг, дирекции
+    традиционно и есть маркер редких, крупных глав жизни, а не текущего
+    года или месяца.
+
+    Считается чистой арифметикой, эфемериды не нужны — дуга одна и та же
+    для всех, а персонализация идёт через то, к натальной Луне КОНКРЕТНОГО
+    человека она применяется и в какой ЕГО дом это попадает.
+    """
+    if natal_moon_lon is None or natal_asc_lon is None:
+        return None
+    MEAN_SOLAR_ARC_PER_YEAR = 360.0 / 365.25
+    age_years = (datetime.utcnow() - datetime(birth_year, birth_month, birth_day)).days / 365.25
+    arc = age_years * MEAN_SOLAR_ARC_PER_YEAR
+    directed_moon_lon = (natal_moon_lon + arc) % 360
+    house = int(((directed_moon_lon - natal_asc_lon) % 360) / 30) + 1
+    return {"house": house, "arc_degrees": round(arc, 2)}
+
+
+def find_markers(profection_house, dasha_planet, extra_houses=None):
     """
     Ищет независимое подтверждение одной и той же жизненной категории
-    сразу несколькими методами расчёта (профекция года + текущая даша +,
-    когда доступно, дом лунара этого месяца). Возвращает список ID
-    категорий-совпадений (пустой список, если нет). Специально НЕ включает
-    логику "на всякий случай" — только точное математическое пересечение,
-    без натяжек.
+    сразу несколькими методами расчёта. Профекция и даша — всегда в игре;
+    extra_houses — необязательный словарь {название техники: номер дома}
+    для любых дополнительных техник (лунар, прогрессии и т.д. по мере
+    добавления новых). Возвращает список ID категорий-совпадений (пустой,
+    если нет). Специально НЕ включает логику "на всякий случай" — только
+    точное математическое пересечение, без натяжек.
     """
     dasha_categories = DASHA_PLANET_TO_CATEGORIES.get(dasha_planet, []) if dasha_planet else []
+    houses = {'профекция': profection_house}
+    if extra_houses:
+        houses.update({k: v for k, v in extra_houses.items() if v is not None})
+
     confirmed = set()
-    if profection_house in dasha_categories:
-        confirmed.add(profection_house)
-    if lunar_house is not None:
-        if lunar_house == profection_house:
-            confirmed.add(profection_house)
-        if lunar_house in dasha_categories:
-            confirmed.add(lunar_house)
+    values = list(houses.values())
+    for h in values:
+        if h in dasha_categories:
+            confirmed.add(h)
+    for i in range(len(values)):
+        for j in range(i + 1, len(values)):
+            if values[i] == values[j]:
+                confirmed.add(values[i])
     return sorted(confirmed)
 
 def calc_bazi(year, month, day, hour, minute):
@@ -3020,6 +3133,16 @@ def summary():
         lines.append(f"АКЦЕНТ ТЕКУЩЕГО ГОДА ЖИЗНИ: {prof['theme']}")
         lines.append("(Это фоновая тема года. Упомяни её органично и своими словами, ТОЛЬКО если она естественно ложится в запрос человека или в общую картину. НЕ притягивай насильно, не называй это 'профекцией' или любым термином — просто как наблюдение о том, чем сейчас 'дышит' его год.)")
 
+        # Соляр — настоящий астрономический расчёт того же года (профекция
+        # выше — просто символический счёт). Отдельной строкой в промпт не
+        # выводим, чтобы не дублировать "акцент года" текстом — участвует
+        # только в маркерах совпадения ниже, но именно там его вес важнее
+        # всего: если символическая профекция и реальный расчёт сошлись
+        # на одном доме — это сильное независимое подтверждение.
+        solar_sun_lon = nat.get('planets', {}).get('Солнце', {}).get('lon')
+        solar_asc_lon = nat.get('houses', {}).get('Асцендент', {}).get('lon')
+        solar = calc_solar_return_house(solar_sun_lon, solar_asc_lon, age, year, month, day)
+
         # Крупный жизненный период (Вимшоттари-даша) — на сегодняшний день
         dasha = calc_vimshottari_dasha(year, month, day, hour, minute, lat, lon)
         if dasha:
@@ -3027,8 +3150,30 @@ def summary():
             lines.append(f"КРУПНЫЙ ЖИЗНЕННЫЙ ПЕРИОД (сейчас, на {today.strftime('%d.%m.%Y')}): {dasha['theme']} (человек в этом периоде примерно {dasha['years_elapsed']} из {dasha['years_total']} лет)")
             lines.append("(Это фоновый долгосрочный период — более крупный масштаб, чем акцент года выше. Упомяни ТОЛЬКО если органично ложится в запрос. НЕ называй это 'дашей' или любым системным термином — просто как наблюдение о более широкой фазе жизни, в которой сейчас находится человек.)")
 
-        # Маркеры совпадения — независимое подтверждение темы двумя и более системами
-        markers = find_markers(prof['house'], dasha['planet'] if dasha else None)
+        # Прогрессии — текущая "глава" жизни, меняется примерно раз в 2.5
+        # года (свой ритм, отдельный и от года-профекции, и от даши).
+        natal_asc_lon = nat.get('houses', {}).get('Асцендент', {}).get('lon')
+        progressed = calc_progressed_moon_house(year, month, day, hour, minute, lat, lon, natal_asc_lon)
+        if progressed:
+            lines.append("")
+            lines.append(f"ТЕКУЩАЯ ГЛАВА (меняется раз в ~2.5 года): {MARKER_CATEGORIES[progressed['house']]}")
+            lines.append("(Это среднесрочный фон — не такой быстрый, как настроение дня, но быстрее года-профекции и большого периода выше. Упомяни ТОЛЬКО если органично ложится в запрос. НЕ называй это 'прогрессией' или любым термином.)")
+
+        # Дирекции — самый медленный фон, меняется примерно раз в 30 лет.
+        # Это не текущая глава, а скорее "десятилетие" или "эпоха" жизни.
+        natal_moon_lon = nat.get('planets', {}).get('Луна', {}).get('lon')
+        directed = calc_directed_moon_house(natal_moon_lon, natal_asc_lon, year, month, day)
+        if directed:
+            lines.append("")
+            lines.append(f"ФОН ЭТОЙ ЖИЗНЕННОЙ ЭПОХИ (меняется раз в ~30 лет): {MARKER_CATEGORIES[directed['house']]}")
+            lines.append("(Это САМЫЙ медленный фон из всех — почти как черта характера, а не текущее состояние. Упомяни ТОЛЬКО если органично ложится в запрос и не повторяет то, что уже сказано выше. НЕ называй это 'дирекцией' или любым термином.)")
+
+        # Маркеры совпадения — независимое подтверждение темы несколькими системами
+        markers = find_markers(prof['house'], dasha['planet'] if dasha else None, {
+            'соляр': solar['house'] if solar else None,
+            'прогрессии': progressed['house'] if progressed else None,
+            'дирекции': directed['house'] if directed else None,
+        })
         if markers:
             lines.append("")
             lines.append("⚡ ПОДТВЕРЖДЁННЫЙ МАРКЕР (это НЕ догадка — минимум два независимых метода расчёта указывают ровно в одну и ту же область жизни):")
@@ -3608,7 +3753,7 @@ def monthly_digest():
         # (как в основной генерации): профекция года, текущая даша и, когда
         # доступна, тема месяца по лунару выше.
         markers = find_markers(prof['house'], dasha['planet'] if dasha else None,
-                                lunar['house'] if lunar else None)
+                                {'лунар': lunar['house']} if lunar else None)
         if markers:
             lines.append("")
             lines.append("⚡ ПОДТВЕРЖДЁННЫЙ МАРКЕР (это НЕ догадка — минимум два независимых метода расчёта указывают ровно в одну и ту же область жизни):")
