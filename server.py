@@ -2532,16 +2532,25 @@ def get_history():
     try:
         key = email_to_key(email)
         raw = fb_db.reference(f'history/{key}').get() or {}
+        # "Продолжить тему" — фича тарифа ПРО. summary нужен только для неё,
+        # остальным тарифам не отдаём — незачем гонять лишние килобайты текста
+        # на каждое открытие истории.
+        user_rec = fb_db.reference(f'users/{key}').get() or {}
+        is_pro = (user_rec.get('subscriptionTier') == 'pro')
         items = []
         for _id, rec in raw.items():
             if isinstance(rec, dict):
-                items.append({
+                item = {
+                    'id': _id,
                     'createdAt': rec.get('createdAt', ''),
                     'firstname': rec.get('firstname', ''),
                     'lastname': rec.get('lastname', ''),
                     'request': rec.get('request', ''),
                     'analysis': rec.get('analysis', ''),
-                })
+                }
+                if is_pro and rec.get('summary'):
+                    item['summary'] = rec.get('summary', '')
+                items.append(item)
         items.sort(key=lambda x: x['createdAt'], reverse=True)
         return jsonify({"status": "ok", "items": items[:50]})
     except Exception as e:
@@ -3392,13 +3401,20 @@ def generate_analysis():
             try:
                 key = email_to_key(email)
                 client_info = data.get('client_info', {}) or {}
-                fb_db.reference(f'history/{key}').push({
+                history_record = {
                     'createdAt': datetime.now().isoformat(),
                     'firstname': client_info.get('firstname', ''),
                     'lastname': client_info.get('lastname', ''),
                     'request': client_request or '',
                     'analysis': analysis_text,
-                })
+                }
+                # summary сохраняем ТОЛЬКО для личных запросов (не совместимости) —
+                # это готовый текстовый портрет человека, нужен кнопке "Продолжить
+                # тему" (тариф ПРО), чтобы не пересчитывать натальные данные заново,
+                # а просто продолжить разговор с той же основой.
+                if not compat_enabled:
+                    history_record['summary'] = summary
+                fb_db.reference(f'history/{key}').push(history_record)
             except Exception as e:
                 print(f"⚠️ Ошибка сохранения истории: {e}")
 
