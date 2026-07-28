@@ -2296,8 +2296,15 @@ CREEM_PRODUCT_TIERS = {
 # и просто возвращался в приложение, не зная, прошли ли деньги. Отправляем
 # только на subscription.paid (см. комментарий у /webhooks/creem) — это
 # событие срабатывает и на первую оплату, и на каждое продление, без дублей.
+#
+# ВАЖНО: раньше здесь был обычный SMTP через Gmail (smtplib) — не заработал
+# ни разу, потому что Railway полностью блокирует исходящий SMTP-трафик
+# (порты 465/587) на уровне платформы, это их сознательная политика против
+# спама, а не баг конфигурации. Официальная рекомендация Railway — сервис
+# с HTTPS API. Перешли на SendGrid (Single Sender Verification на тот же
+# soundcher11@gmail.com — свой домен не нужен).
 GMAIL_SENDER = 'soundcher11@gmail.com'
-GMAIL_APP_PASSWORD = os.environ.get('GMAIL_APP_PASSWORD', '')
+SENDGRID_API_KEY = os.environ.get('SENDGRID_API_KEY', '')
 
 TIER_DISPLAY = {
     'start': {'name_ru': 'Старт', 'name_uk': 'Старт', 'name_pl': 'Start', 'name_en': 'Start', 'price': '€9.99'},
@@ -2349,29 +2356,58 @@ RECEIPT_EMAIL_TEXT = {
 }
 
 
+def _send_via_sendgrid(to_email, subject, body_text):
+    """
+    Общая отправка через SendGrid HTTPS API (v3/mail/send). Никакого прямого
+    сетевого сокета, поэтому блокировку SMTP на Railway это обходит полностью.
+    Возвращает (ok: bool, detail: str).
+    """
+    if not SENDGRID_API_KEY:
+        return False, "sendgrid_api_key_not_configured"
+    payload = {
+        "personalizations": [{"to": [{"email": to_email}]}],
+        "from": {"email": GMAIL_SENDER, "name": "AION Vi"},
+        "subject": subject,
+        "content": [{"type": "text/plain", "value": body_text}],
+    }
+    try:
+        resp = http_requests.post(
+            "https://api.sendgrid.com/v3/mail/send",
+            headers={
+                "Authorization": f"Bearer {SENDGRID_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=10,
+        )
+        # SendGrid отвечает 202 без тела при успехе — это единственный "ок" статус.
+        if resp.status_code == 202:
+            return True, "sent"
+        return False, f"sendgrid_status_{resp.status_code}: {resp.text[:300]}"
+    except Exception as e:
+        return False, str(e)
+
+
 def send_receipt_email(to_email, tier_code, analyses, lang='ru'):
     """
     Письмо-квитанция после оплаты. Любой сбой здесь — только в лог, никогда
     не поднимается наружу: начисление пакета важнее письма о нём, и одно
     не должно ломать другое.
     """
-    if not GMAIL_APP_PASSWORD or not to_email:
+    if not SENDGRID_API_KEY or not to_email:
         return
     try:
         disp = TIER_DISPLAY.get(tier_code, TIER_DISPLAY['start'])
         lang_key = lang if lang in RECEIPT_EMAIL_TEXT else 'ru'
         tier_name = disp.get(f'name_{lang_key}', disp['name_ru'])
         texts = RECEIPT_EMAIL_TEXT[lang_key]
-
-        msg = MIMEText(texts['body'](tier_name, disp['price'], analyses), 'plain', 'utf-8')
-        msg['Subject'] = texts['subject'](tier_name)
-        msg['From'] = f'AION Vi <{GMAIL_SENDER}>'
-        msg['To'] = to_email
-
-        with smtplib.SMTP('smtp.gmail.com', 587, timeout=10) as server:
-            server.starttls()
-            server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
-            server.send_message(msg)
+        ok, detail = _send_via_sendgrid(
+            to_email,
+            texts['subject'](tier_name),
+            texts['body'](tier_name, disp['price'], analyses),
+        )
+        if not ok:
+            print(f"⚠️ Не удалось отправить письмо-квитанцию: {detail}")
     except Exception as e:
         print(f"⚠️ Не удалось отправить письмо-квитанцию: {e}")
 
@@ -2384,8 +2420,8 @@ def admin_test_receipt_email():
     to_email = request.args.get('to_email', '').strip()
     if not to_email:
         return jsonify({"status": "error", "message": "to_email_required"}), 400
-    if not GMAIL_APP_PASSWORD:
-        return jsonify({"status": "error", "message": "gmail_app_password_not_configured"}), 500
+    if not SENDGRID_API_KEY:
+        return jsonify({"status": "error", "message": "sendgrid_api_key_not_configured"}), 500
     tier_code = request.args.get('tier_code', 'pro')
     analyses = int(request.args.get('analyses', 40))
     lang = request.args.get('lang', 'ru')
@@ -2394,15 +2430,14 @@ def admin_test_receipt_email():
         lang_key = lang if lang in RECEIPT_EMAIL_TEXT else 'ru'
         tier_name = disp.get(f'name_{lang_key}', disp['name_ru'])
         texts = RECEIPT_EMAIL_TEXT[lang_key]
-        msg = MIMEText(texts['body'](tier_name, disp['price'], analyses), 'plain', 'utf-8')
-        msg['Subject'] = texts['subject'](tier_name)
-        msg['From'] = f'AION Vi <{GMAIL_SENDER}>'
-        msg['To'] = to_email
-        with smtplib.SMTP('smtp.gmail.com', 587, timeout=10) as server:
-            server.starttls()
-            server.login(GMAIL_SENDER, GMAIL_APP_PASSWORD)
-            server.send_message(msg)
-        return jsonify({"status": "ok", "message": "sent"})
+        ok, detail = _send_via_sendgrid(
+            to_email,
+            texts['subject'](tier_name),
+            texts['body'](tier_name, disp['price'], analyses),
+        )
+        if ok:
+            return jsonify({"status": "ok", "message": "sent"})
+        return jsonify({"status": "error", "message": detail}), 500
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
 
