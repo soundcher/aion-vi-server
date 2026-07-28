@@ -9,6 +9,7 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import ephem
+import calendar
 import math
 import random
 import hmac
@@ -1806,20 +1807,78 @@ DASHA_PLANET_TO_CATEGORIES = {
     'Меркурий': [3, 11],
 }
 
-def find_markers(profection_house, dasha_planet):
+def calc_lunar_return(natal_moon_lon, natal_asc_lon, year, month):
+    """
+    Лунар (лунное возвращение) — примерно раз в 27.3 дня транзитная Луна
+    проходит ровно ту же точку неба, что и в момент рождения человека.
+    Это самая короткая и личная из "тем месяца" — короче соляра и профекции
+    (у них цикл год), поэтому лучше всего подходит именно для ежемесячного
+    обзора, а не для годовых тем.
+
+    Ищем день В ЭТОМ календарном месяце, когда транзитная Луна ближе всего
+    подходит к натальной Луне, и определяем, в какой дом натальной карты
+    (система равных домов от Асцендента — не требует сложных таблиц, даёт
+    надёжный номер дома) она в этот момент попадает. Номер дома напрямую
+    переиспользует MARKER_CATEGORIES — ту же 12-частную структуру, что уже
+    используется профекцией и дашами, поэтому все три техники можно
+    сверять друг с другом на одном языке категорий.
+
+    Возвращает None, если в этом месяце нет достаточно точного возвращения
+    (бывает при коротких месяцах) — честнее промолчать, чем притянуть
+    неточное совпадение.
+    """
+    if natal_moon_lon is None or natal_asc_lon is None:
+        return None
+
+    days_in_month = calendar.monthrange(year, month)[1]
+    best_day, best_diff, best_moon_lon = None, 999.0, None
+
+    for day_num in range(1, days_in_month + 1):
+        date_str = datetime_to_ephem_str(year, month, day_num, 12.0)
+        try:
+            moon_lon = get_planet_lon(ephem.Moon, date_str)
+        except Exception:
+            continue
+        diff = abs(moon_lon - natal_moon_lon)
+        if diff > 180:
+            diff = 360 - diff
+        if diff < best_diff:
+            best_day, best_diff, best_moon_lon = day_num, diff, moon_lon
+
+    # Луна проходит ~13°/сутки, шаг сканирования — сутки (полдень), поэтому
+    # худшая ошибка выборки — примерно половина суточного хода (~6.5°).
+    # Если даже лучший день даёт больше 7° — реального возвращения в этом
+    # месяце просто нет (бывает на коротких месяцах), честно возвращаем None.
+    if best_day is None or best_diff > 7.0:
+        return None
+
+    house = int(((best_moon_lon - natal_asc_lon) % 360) / 30) + 1
+
+    return {
+        "date": f"{best_day:02d}.{month:02d}.{year}",
+        "house": house,
+        "orb": round(best_diff, 2),
+    }
+
+def find_markers(profection_house, dasha_planet, lunar_house=None):
     """
     Ищет независимое подтверждение одной и той же жизненной категории
-    сразу двумя методами расчёта (профекция года + текущая даша).
-    Возвращает список ID категорий-совпадений (пустой список, если нет).
-    Специально НЕ включает логику "на всякий случай" — только точное
-    математическое пересечение, без натяжек.
+    сразу несколькими методами расчёта (профекция года + текущая даша +,
+    когда доступно, дом лунара этого месяца). Возвращает список ID
+    категорий-совпадений (пустой список, если нет). Специально НЕ включает
+    логику "на всякий случай" — только точное математическое пересечение,
+    без натяжек.
     """
-    if not dasha_planet:
-        return []
-    dasha_categories = DASHA_PLANET_TO_CATEGORIES.get(dasha_planet, [])
+    dasha_categories = DASHA_PLANET_TO_CATEGORIES.get(dasha_planet, []) if dasha_planet else []
+    confirmed = set()
     if profection_house in dasha_categories:
-        return [profection_house]
-    return []
+        confirmed.add(profection_house)
+    if lunar_house is not None:
+        if lunar_house == profection_house:
+            confirmed.add(profection_house)
+        if lunar_house in dasha_categories:
+            confirmed.add(lunar_house)
+    return sorted(confirmed)
 
 def calc_bazi(year, month, day, hour, minute):
     year_p = get_bazi_year_pillar(year, month, day)
@@ -3525,6 +3584,14 @@ def monthly_digest():
         prof = calc_profection(age, month, day, year)
         dasha = calc_vimshottari_dasha(year, month, day, hour, minute, lat, lon)
 
+        # Лунар — тема ЭТОГО календарного месяца (не текущего момента, как
+        # в /generate) по лунному возвращению. Единственная из трёх техник
+        # ниже, у которой цикл — месяц, а не год, поэтому именно она даёт
+        # обзору месяца собственный, а не позаимствованный у годовых тем ритм.
+        natal_moon_lon = nat.get('planets', {}).get('Луна', {}).get('lon')
+        natal_asc_lon = nat.get('houses', {}).get('Асцендент', {}).get('lon')
+        lunar = calc_lunar_return(natal_moon_lon, natal_asc_lon, now.year, now.month)
+
         transit_windows = find_transit_windows(nat.get('planets', {}), days_ahead=45)
         this_month_windows = [
             w for w in transit_windows
@@ -3534,11 +3601,28 @@ def monthly_digest():
         lines = [f"АКЦЕНТ ГОДА: {prof['theme']}"]
         if dasha:
             lines.append(f"КРУПНЫЙ ПЕРИОД: {dasha['theme']}")
+        if lunar:
+            lines.append(f"ТЕМА ЭТОГО МЕСЯЦА (по дате {lunar['date']}): {MARKER_CATEGORIES[lunar['house']]}")
+
+        # Маркеры совпадения — теперь три независимые техники вместо двух
+        # (как в основной генерации): профекция года, текущая даша и, когда
+        # доступна, тема месяца по лунару выше.
+        markers = find_markers(prof['house'], dasha['planet'] if dasha else None,
+                                lunar['house'] if lunar else None)
+        if markers:
+            lines.append("")
+            lines.append("⚡ ПОДТВЕРЖДЁННЫЙ МАРКЕР (это НЕ догадка — минимум два независимых метода расчёта указывают ровно в одну и ту же область жизни):")
+            for cat_id in markers:
+                lines.append(f"— {MARKER_CATEGORIES[cat_id]}")
+            lines.append("(Раз это подтверждено — можешь говорить об этом увереннее, чем об остальных фоновых темах, но только если релевантно. НЕ называй методы или системные термины.)")
+
         if this_month_windows:
+            lines.append("")
             lines.append("РЕАЛЬНЫЕ ОКНА ЭТОГО МЕСЯЦА (посчитано, не придумано):")
             for w in this_month_windows:
                 lines.append(f"— {w['start']}–{w['end']} (точнее всего {w['peak']})")
         else:
+            lines.append("")
             lines.append("В этом месяце нет точных совпадений в ближайших планетных окнах — "
                           "НЕ придумывай их, честно строй обзор на фоновой теме года/периода выше.")
         data_block = "\n".join(lines)
