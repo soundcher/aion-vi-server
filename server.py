@@ -1235,18 +1235,31 @@ def calc_current_transits(natal_planets, target_date=None):
     return transits
 
 
-def find_transit_windows(natal_planets, days_ahead=60):
+def find_transit_windows(natal_planets, days_ahead=60, past_buffer_days=7):
     """
-    Сканирует ближайшие days_ahead дней и находит РЕАЛЬНЫЕ даты, когда
-    транзитная планета входит в точный орб к натальной точке человека.
+    Сканирует days_ahead дней ВПЕРЁД, плюс past_buffer_days дней НАЗАД от
+    сегодня, и находит РЕАЛЬНЫЕ даты, когда транзитная планета входит в
+    точный орб к натальной точке человека.
+
+    Буфер назад — обязателен. Раньше сканирование начиналось строго с
+    сегодняшнего дня: если настоящий пик окна приходился на день-два ДО
+    момента запроса, функция его не видела и подставляла вместо реального
+    пика лучший из видимых (урезанных) дней — а это уже не тот же самый
+    пик. При следующем запросе "сегодня" сдвигалось, и ближайшее окно
+    "уплывало" вместе с ним, хотя ничего в данных человека не менялось.
+    Буфер назад устраняет обрезание: окно либо видно целиком, либо не
+    видно вовсе — без искажённых половинок.
+
     Возвращает список конкретных окон — начало, конец, дата пика точности.
-    Это и есть настоящая замена придуманным числам: цифры посчитаны, не выдуманы.
+    Окна, полностью ушедшие в прошлое, отфильтрованы — в промпт не попадают.
     """
     today = datetime.utcnow().date()
+    scan_start = today - timedelta(days=past_buffer_days)
+    total_days = past_buffer_days + days_ahead
     daily_hits = {}
 
-    for offset in range(days_ahead + 1):
-        day = today + timedelta(days=offset)
+    for offset in range(total_days + 1):
+        day = scan_start + timedelta(days=offset)
         date_str = datetime_to_ephem_str(day.year, day.month, day.day, 12.0)
         hits = calc_current_transits(natal_planets, target_date=date_str)
         for h in hits:
@@ -1263,8 +1276,7 @@ def find_transit_windows(natal_planets, days_ahead=60):
             if (day - prev_day).days > 1:
                 windows.append({
                     "transit_planet": t_name, "natal_planet": n_name, "aspect": aspect,
-                    "start": start.strftime('%d.%m.%Y'), "end": prev_day.strftime('%d.%m.%Y'),
-                    "peak": best_day.strftime('%d.%m.%Y'), "peak_orb": round(best_orb, 2),
+                    "start": start, "end": prev_day, "peak": best_day, "peak_orb": round(best_orb, 2),
                 })
                 start, best_orb, best_day = day, orb, day
             elif orb < best_orb:
@@ -1272,12 +1284,23 @@ def find_transit_windows(natal_planets, days_ahead=60):
             prev_day = day
         windows.append({
             "transit_planet": t_name, "natal_planet": n_name, "aspect": aspect,
-            "start": start.strftime('%d.%m.%Y'), "end": prev_day.strftime('%d.%m.%Y'),
-            "peak": best_day.strftime('%d.%m.%Y'), "peak_orb": round(best_orb, 2),
+            "start": start, "end": prev_day, "peak": best_day, "peak_orb": round(best_orb, 2),
         })
 
+    # Окна, которые уже полностью в прошлом (не длятся хотя бы по сегодня) —
+    # выбрасываем: рассказывать человеку про "лучший день", который уже
+    # прошёл, только сбивает с толку.
+    windows = [w for w in windows if w["end"] >= today]
+
     windows.sort(key=lambda w: w["peak_orb"])
-    return windows
+    return [
+        {
+            "transit_planet": w["transit_planet"], "natal_planet": w["natal_planet"], "aspect": w["aspect"],
+            "start": w["start"].strftime('%d.%m.%Y'), "end": w["end"].strftime('%d.%m.%Y'),
+            "peak": w["peak"].strftime('%d.%m.%Y'), "peak_orb": w["peak_orb"],
+        }
+        for w in windows
+    ]
 
 
 # ─────────────────────────────────────────────
