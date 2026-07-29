@@ -3261,7 +3261,22 @@ def summary():
         lines.append(f"Ворота Луны (личность): {gates.get('moon_personality', '—')}")
         lines.append(f"Ворота Солнца (дизайн): {gates.get('sun_design', '—')}")
 
-        return jsonify({"summary": "\n".join(lines)})
+        return jsonify({
+            "summary": "\n".join(lines),
+            # ВРЕМЕННО ДЛЯ ТЕСТА (29.07.2026) — сырые цифры 4 новых техник
+            # прогнозов, чтобы Слава мог сверить расчёт вручную. Убрать
+            # после того, как тест пройден.
+            "debug_forecast": {
+                "профекция": {"дом": prof['house'], "тема": prof['theme']},
+                "даша": ({"тема": dasha['theme'], "планета": dasha['planet'],
+                          "лет_пройдено": dasha['years_elapsed'], "лет_всего": dasha['years_total']}
+                         if dasha else None),
+                "соляр": solar,
+                "прогрессии": progressed,
+                "дирекции": directed,
+                "маркеры_совпадения": [MARKER_CATEGORIES[c] for c in markers] if markers else []
+            }
+        })
 
     except Exception as e:
         return jsonify({"status": "error", "message": str(e)}), 500
@@ -3659,20 +3674,7 @@ def generate_analysis():
             "analysis": analysis_text,
             "tokens_used": message.usage.input_tokens + message.usage.output_tokens,
             "analyses_left": new_left,
-            "referralBonusApplied": referral_bonus_applied if firebase_db_available and email else False,
-            # ВРЕМЕННО ДЛЯ ТЕСТА (29.07.2026) — сырые цифры 4 новых техник
-            # прогнозов, чтобы Слава мог сверить расчёт вручную. Убрать
-            # после того, как тест пройден.
-            "debug_forecast": {
-                "профекция": {"дом": prof['house'], "тема": prof['theme']},
-                "даша": ({"тема": dasha['theme'], "планета": dasha['planet'],
-                          "лет_пройдено": dasha['years_elapsed'], "лет_всего": dasha['years_total']}
-                         if dasha else None),
-                "соляр": solar,
-                "прогрессии": progressed,
-                "дирекции": directed,
-                "маркеры_совпадения": [MARKER_CATEGORIES[c] for c in markers] if markers else []
-            }
+            "referralBonusApplied": referral_bonus_applied if firebase_db_available and email else False
         })
 
     except anthropic.AuthenticationError:
