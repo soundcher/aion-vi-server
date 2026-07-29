@@ -3712,22 +3712,9 @@ def monthly_digest():
         now = datetime.now()
         month_key = now.strftime('%Y-%m')
 
-        marker_ref = fb_db.reference(f'monthly_digest_marker/{key}')
-        existing_month = marker_ref.get()
-
-        if existing_month == month_key:
-            cached = fb_db.reference(f'monthly_digest_cache/{key}').get() or {}
-            return jsonify({
-                "status": "ok",
-                "isNew": False,
-                "analysis": cached.get('analysis', ''),
-                "month": month_key
-            })
-
-        # ВАЖНО: раньше здесь было `err = validate_birth_data(data)` — но эта
-        # функция возвращает готовые числа, а не текст ошибки. Любой непустой
-        # ответ считался ошибкой, поэтому "Обзор месяца" отваливался ВСЕГДА,
-        # при полностью корректных данных. Теперь как в остальных местах.
+        # Данные рождения нужны и для кэшированной ветки ниже (чтобы посчитать
+        # debug_forecast даже когда обзор месяца уже был сгенерирован), и для
+        # свежей генерации — поэтому парсим их один раз здесь, до проверки кэша.
         try:
             day, month, year, hour, minute = validate_birth_data(data)
         except ValueError as ve:
@@ -3736,6 +3723,33 @@ def monthly_digest():
         lat, lon, coord_err = read_coords(data)
         if coord_err:
             return jsonify({"status": "error", "message": coord_err}), 400
+
+        marker_ref = fb_db.reference(f'monthly_digest_marker/{key}')
+        existing_month = marker_ref.get()
+
+        if existing_month == month_key:
+            cached = fb_db.reference(f'monthly_digest_cache/{key}').get() or {}
+            # ВРЕМЕННО ДЛЯ ТЕСТА (29.07.2026) — считаем Лунар отдельно для
+            # проверки, даже если обзор месяца уже закэширован и текст не
+            # перегенерируется. Убрать вместе с остальными debug_forecast.
+            debug_lunar = None
+            try:
+                nat_dbg = calc_natal(year, month, day, hour, minute, lat, lon)
+                lunar_dbg = calc_lunar_return(
+                    nat_dbg.get('planets', {}).get('Луна', {}).get('lon'),
+                    nat_dbg.get('houses', {}).get('Асцендент', {}).get('lon'),
+                    now.year, now.month
+                )
+                debug_lunar = {"лунар": lunar_dbg}
+            except Exception:
+                pass
+            return jsonify({
+                "status": "ok",
+                "isNew": False,
+                "analysis": cached.get('analysis', ''),
+                "month": month_key,
+                "debug_forecast": debug_lunar
+            })
 
         lang_instruction = data.get('lang_instruction', 'Отвечай на русском языке.')
 
