@@ -238,6 +238,13 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 FREE_ANALYSES_ON_SIGNUP = 2   # обычная регистрация, без промокода
 ANALYSES_PER_PROMO = 5        # регистрация с действующим промокодом
 
+# Какой уровень доступа открывает промокод. 'pro' — весь продукт целиком:
+# Совместимость до 4 человек, PDF, "Продолжить тему". Смысл в том, что
+# промокод раздаётся для знакомства с продуктом, и урезанная версия этой
+# задачи не решает. Токенов это не добавляет — расход ограничен числом
+# запросов (ANALYSES_PER_PROMO), а не тарифом.
+PROMO_TIER = 'pro'
+
 
 def decoded_claims_from_request():
     """Разбирает пропуск целиком. Возвращает словарь или None."""
@@ -315,13 +322,29 @@ def resolve_email(data, allow_guest=False):
 def build_profile(key):
     """Сводка по пользователю для приложения. Баланс отдаёт сервер, не браузер."""
     u = fb_db.reference(f'users/{key}').get() or {}
+
+    # Разовое дочинивание старых аккаунтов: те, кто зарегистрировался по
+    # промокоду ДО того, как промокод стал выдавать тариф, остались с пустым
+    # тарифом — то есть на уровне "бесплатный", без Совместимости и PDF.
+    # Проставляем им доступ здесь, при первом же обращении за профилем,
+    # чтобы не делать отдельную ручную миграцию. Тех, кто платил (у них уже
+    # есть свой тариф), это не трогает.
+    tier = u.get('subscriptionTier', '')
+    promo_code = u.get('promo', '')
+    if not tier and promo_code and promo_code != 'signup':
+        tier = PROMO_TIER
+        try:
+            fb_db.reference(f'users/{key}/subscriptionTier').set(tier)
+        except Exception:
+            pass
+
     return {
         'email': u.get('email', ''),
         'nickname': u.get('nickname', ''),
         'analysesLeft': u.get('analysesLeft', 0),
         'analysesTotal': u.get('analysesTotal', 0),
         'unlimited': bool(u.get('unlimited')),
-        'subscriptionTier': u.get('subscriptionTier', ''),
+        'subscriptionTier': tier,
         'subscriptionStatus': u.get('subscriptionStatus', ''),
         'lang': u.get('lang', 'ru'),
     }
@@ -552,6 +575,16 @@ def auth_register():
         'loginMethod': login_method,
         'firstGenerationAt': '',
     }
+
+    # Промокод открывает ВСЕ функции (уровень Про), а не только начисляет
+    # запросы. Раньше тариф не записывался вообще — человек с промокодом
+    # оставался на уровне "бесплатный": без Совместимости, без PDF, без
+    # "Продолжить тему", то есть не мог увидеть и половины продукта.
+    # Денег это не стоит: расход считается по числу запросов (analysesLeft),
+    # тариф только открывает функции. Если человек потом оплатит пакет,
+    # вебхук перезапишет тариф на оплаченный — это правильное поведение.
+    if promo_applied:
+        record['subscriptionTier'] = PROMO_TIER
 
     # Приглашение от друга. Бонус +5 обоим начислится не сейчас, а когда
     # приглашённый сделает свой первый запрос — иначе накрутка сводится
